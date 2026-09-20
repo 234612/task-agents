@@ -4,8 +4,8 @@ from pathlib import Path
 from deepagents import create_deep_agent
 from langchain_core.language_models import BaseChatModel
 
-from .tools.web_research import WEB_RESEARCH_TOOLS
-from .prompts import MARKET_RESEARCHER_PROMPT
+from task_agents.agent.market_researcher_engine.tools.web_research import WEB_RESEARCH_TOOLS
+from task_agents.agent.market_researcher_engine.prompts import MARKET_RESEARCHER_PROMPT
 
 def _load_prompt(name: str) -> str:
     """从 subagents/{name}/prompt.md 加载提示词"""

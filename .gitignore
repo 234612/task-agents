@@ -64,6 +64,7 @@ backend/env/
 backend/ENV/
 
 # Python 编译产物
+**/__pycache__/
 backend/__pycache__/
 backend/*.py[cod]
 backend/*$py.class

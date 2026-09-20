@@ -10,8 +10,8 @@ from typing import Dict, Any
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.memory import MemorySaver
 
-from ..config import Settings
-from .market_researcher_engine.agent import create_market_researcher
+from task_agents.core.config import Settings
+from task_agents.agent.market_researcher_engine.agent import create_market_researcher
 
 logger = logging.getLogger(__name__)
 

@@ -1,7 +1,7 @@
 """MySQL 数据库引擎和会话工厂"""
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from ..config import Settings
-from .models import Base
+from task_agents.core.config import Settings
+from task_agents.database.models import Base
 
 
 def create_engine(settings: Settings):

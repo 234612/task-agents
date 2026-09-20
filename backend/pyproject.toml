@@ -1,0 +1,19 @@
+[project]
+name = "task-agents"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "deepagents>=0.7.15",
+    "fastapi>=0.141.1",
+    "langchain>=1.4.1",
+    "langchain-community>=0.4.2",
+    "langchain-openai>=1.6.2",
+    "langgraph>=1.2.11",
+    "uvicorn>=0.53.0",
+    "pydantic-settings>=2.0.0",
+    "sqlalchemy>=2.0.0",
+    "aiomysql>=0.2.0",
+    "cryptography>=42.0.0",
+    "motor>=3.3.0",
+]

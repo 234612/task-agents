@@ -1,0 +1,92 @@
+# ============================================================
+# 全局忽略（前后端通用）
+# ============================================================
+# IDE 配置（每个人的本地配置不同，不提交）
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sln
+*.iml
+
+# 操作系统生成文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+
+# ============================================================
+# 前端（frontend/ - Next.js）
+# ============================================================
+# 依赖目录
+frontend/node_modules/
+
+# Next.js 构建缓存和产物（核心，必须忽略）
+frontend/.next/
+frontend/out/
+
+# Next.js 开发日志
+frontend/next-env.d.ts
+
+# 本地私有环境变量
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.production.local
+frontend/*.local
+
+# 测试覆盖率
+frontend/coverage/
+
+# TypeScript 编译产物
+frontend/*.tsbuildinfo
+
+# 日志
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+
+
+# ============================================================
+# 后端（backend/ - Python）
+# ============================================================
+# 虚拟环境目录
+backend/.venv/
+backend/venv/
+backend/env/
+backend/ENV/
+
+# Python 编译产物
+backend/__pycache__/
+backend/*.py[cod]
+backend/*$py.class
+backend/*.pyc
+backend/*.pyo
+backend/*.pyd
+backend/*.so
+
+# 环境变量文件（敏感信息，如 API Key、数据库密码，必须忽略）
+backend/.env
+backend/.env.local
+backend/.env.*.local
+
+# 测试相关
+backend/.pytest_cache/
+backend/.coverage
+backend/htmlcov/
+backend/.tox/
+
+# 数据库文件（如果用了 SQLite）
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+
+# Pip 相关
+backend/pip-wheel-metadata/

@@ -108,9 +108,9 @@ class ChatService:
             )
 
         # —— 1. 归属校验：会话必须存在且属于该用户 ——
-        await self._session_service.get_session_for_user(session_id, user_id)
+        await self.ensure_session_owned(session_id, user_id)
 
-        agent = await self._resolve_agent(agent_key)
+        agent = self.resolve_agent(agent_key)
 
         is_first_turn = await self._is_first_turn(session_id)
 
@@ -142,13 +142,6 @@ class ChatService:
             is_first_turn=is_first_turn,
             tool_calls=tool_calls,
         )
-
-    async def _resolve_agent(self, agent_key: str) -> Any:
-        """按 key 获取 Agent 实例"""
-        try:
-            return self._agent_getter(agent_key)
-        except KeyError as e:
-            raise AgentNotFoundError(str(e)) from e
 
     async def _is_first_turn(self, session_id: str) -> bool:
         """判断本轮是否为会话首轮（首轮才需要生成标题）
@@ -340,6 +333,152 @@ class ChatService:
         except Exception as e:
             logger.exception("流式聊天异常: %s", e)
             yield format_sse({"type": "error", "message": str(e)})
+
+
+    # ==================== 前置校验（供流式路由复用） ====================
+
+    async def ensure_session_owned(self, session_id: str, user_id: str) -> None:
+        """校验会话存在且归属该用户
+
+        供 SSE 流式路由在返回 StreamingResponse **之前**调用——响应一旦开始
+        发送，HTTP 状态码已固定，越权与不存在就再无法正确表达。
+
+        Raises:
+            SessionNotFoundError: 会话不存在或已软删除
+            SessionAccessDeniedError: 会话属于其他用户
+            RuntimeError: 未装配 session_service
+        """
+        if self._session_service is None:
+            raise RuntimeError(
+                "ensure_session_owned 需要 SessionService，当前实例未装配"
+            )
+        await self._session_service.get_session_for_user(session_id, user_id)
+
+    def resolve_agent(self, agent_key: str) -> Any:
+        """按 key 获取 Agent 实例（同步版，供路由在流式响应前做前置校验）
+
+        Raises:
+            AgentNotFoundError: agent_key 未注册
+        """
+        try:
+            return self._agent_getter(agent_key)
+        except KeyError as e:
+            raise AgentNotFoundError(str(e)) from e
+
+    # ==================== 流式 + 持久化（前端主链路） ====================
+
+    async def stream_chat_persist(
+        self,
+        agent: Any,
+        content: str,
+        session_id: str,
+        user_id: str,
+        on_complete: Any,
+    ) -> AsyncIterator[str]:
+        """流式聊天并在结束后持久化，yield SSE 格式字符串
+
+        与 stream_chat 的区别：本方法在推送完回复后执行三存储写入，
+        让前端既能看到打字机效果，刷新后又能从 MongoDB 读回历史。
+
+        关键时序：done 事件必须在持久化**完成之后**才发送。前端收到 done
+        通常会立刻刷新会话列表/历史，若落库尚未完成就会读到旧数据，出现
+        "刚发的消息不见了"的竞态。done 事件携带 persisted 与 message_count，
+        供前端直接更新本地状态，省去一次列表请求。
+
+        客户端中途断连时不持久化半截回复（用 completed 标志位控制），
+        避免落库一条没有结尾的助手消息。
+
+        Args:
+            on_complete: 异步回调，签名 (assistant_text, tool_calls) -> Optional[int]，
+                         返回最新 message_count。由路由层注入 persist_turn，
+                         使服务层不依赖 FastAPI 的 app 对象。
+        """
+        accumulated = ""
+        tool_calls: list[ToolCall] = []
+        completed = False
+
+        try:
+            stream_input = {"messages": [{"role": "user", "content": content}]}
+            stream_config = {
+                "configurable": {
+                    # thread_id 与 session_id 一致：新建会话即新建 thread
+                    "thread_id": session_id,
+                    "context": {"user_id": user_id},
+                }
+            }
+
+            logger.info(
+                "开始流式聊天(持久化): user_id=%s session_id=%s", user_id, session_id
+            )
+
+            async for chunk_type, chunk_data in agent.astream(
+                stream_input,
+                stream_config,
+                stream_mode=["messages", "updates"],
+            ):
+                # 模式A：模型回复增量（前端打字机效果）
+                if chunk_type == "messages":
+                    msg = chunk_data[0]
+                    piece = self._extract_text(self._get_field(msg, "content"))
+                    if piece:
+                        # 累积口径与前端 accumulated 完全一致，
+                        # 保证「屏幕上看到的」和「落库的」是同一份文本
+                        accumulated += piece
+                        yield _format_sse({"type": "content", "content": piece})
+
+                    # 工具调用：流式 chunk 可能分片，这里取最后一次非空的完整值
+                    calls = self._extract_tool_calls(self._get_field(msg, "tool_calls"))
+                    if calls:
+                        tool_calls = calls
+
+                # 模式B：节点状态更新（前端展示思考链）
+                elif chunk_type == "updates":
+                    node_name = list(chunk_data.keys())[0]
+                    if node_name not in ("__start__", "__end__"):
+                        node_output = chunk_data[node_name]
+                        yield _format_sse({
+                            "type": "node_update",
+                            "node": node_name,
+                            "data": str(node_output)[:200],
+                        })
+
+            completed = True
+
+        except Exception as e:
+            logger.exception("流式聊天异常: session_id=%s", session_id)
+            yield _format_sse({"type": "error", "message": str(e)})
+            return
+
+        if not completed:
+            # 理论上到不了这里：异常已 return，客户端断连会触发 CancelledError
+            # 直接冒泡（刻意不捕获，避免把取消当成功持久化半截回复）
+            return
+
+        # —— 流式推送完毕，执行三存储持久化 ——
+        message_count: Optional[int] = None
+        persisted = True
+        try:
+            message_count = await on_complete(accumulated, tool_calls)
+            persisted = message_count is not None
+        except Exception:
+            logger.exception("流式对话持久化失败: session_id=%s", session_id)
+            persisted = False
+
+        if not persisted:
+            logger.error(
+                "回复已推送但持久化失败，历史中可能缺失本轮: session_id=%s", session_id
+            )
+
+        yield _format_sse({
+            "type": "done",
+            "persisted": persisted,
+            "message_count": message_count,
+        })
+
+
+def _format_sse(data: dict) -> str:
+    """格式化为 SSE data 帧（ensure_ascii=False 保证中文原样传输）"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 __all__ = ["AgentNotFoundError", "ChatService", "ChatTurnResult"]

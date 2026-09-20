@@ -172,12 +172,68 @@ INFO:     Uvicorn running on http://0.0.0.0:8000
 | PATCH | `/api/sessions/{session_id}/title` | 手动更新标题 |
 | POST | `/api/sessions/{session_id}/archive` | 归档会话 |
 | DELETE | `/api/sessions/{session_id}?user_id=` | 软删除会话（Mongo 历史保留，Redis 上下文释放） |
-| POST | `/api/chat` | 发送消息，执行三存储双写 |
-| POST | `/chat` | 既有 SSE 流式接口，前端 `useAgentChat.ts` 在用 |
+| POST | `/api/chat` | 发送消息，一次性返回完整回复，执行三存储双写 |
+| POST | `/api/chat/stream` | **前端主链路**：SSE 流式推送 + 三存储持久化 |
+| POST | `/chat` | 早期 SSE 接口，仅流式不持久化，保留兼容，新代码勿用 |
 
 `POST /api/chat` 的写入路径：**同步**写 Redis（上下文即时生效）+ **同步**更新 MySQL（`updated_at`、`message_count`）+ **异步**写 MongoDB（`BackgroundTasks`，不阻塞响应）。首轮对话额外在后台由 LLM 生成标题并回写。
 
-> 归属校验：`/api/chat` 与 `/messages` 都会校验 `session_id` 是否属于请求的 `user_id`，越权返回 403，会话不存在返回 404。
+`POST /api/chat/stream` 的差异：回复以 SSE 增量推送（打字机效果），推送完毕后**同步 await** 写 MongoDB，再下发 `done` 事件。之所以不交给后台任务，是为了消除竞态——前端收到 `done` 通常会立刻刷新历史，若落库尚未完成就会读不到刚发的消息。`done` 事件负载：
+
+```json
+{"type": "done", "persisted": true, "message_count": 4}
+```
+
+SSE 事件类型：`content`（回复增量）、`node_update`（思考链）、`done`（结束）、`error`（失败）。
+
+> 归属校验：`/api/chat`、`/api/chat/stream` 与 `/messages` 都会校验 `session_id` 是否属于请求的 `user_id`，越权返回 403，会话不存在返回 404。流式接口的校验**必须在响应开始前**完成——SSE 一旦开始发送，状态码已固定为 200，此后无法再表达权限错误。
+
+---
+
+## 第三步：启动前端
+
+```bash
+cd ../frontend
+npm install      # 首次需要
+npm run dev
+```
+
+访问 http://localhost:3000。
+
+### 3.1 用户身份（当前阶段）
+
+登录功能留待下一阶段实现，现阶段 `user_id` 由前端 hardcode 传递，服务端直接依据它返回名下会话。配置集中在 `frontend/src/lib/config.ts`：
+
+```ts
+export const CURRENT_USER_ID = 'userid_1';   // 接入登录后只需改这一处
+export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
+```
+
+### 3.2 写入演示数据
+
+首次启动时侧边栏是空的。执行种子脚本写入演示会话，即可看到列表与对话内容效果：
+
+```bash
+cd backend
+uv run python scripts/seed_demo_data.py            # 写入 4 个演示会话
+uv run python scripts/seed_demo_data.py --reset    # 先清空该用户全部会话再写入
+```
+
+脚本特性：
+- **幂等且安全**：会话 ID 固定。默认只覆盖这些固定的演示会话，**不会**触碰用户通过前端真实创建的数据；只有显式传 `--reset` 才清空该用户全部会话
+- 三存储同时写入并自我核对：MySQL `message_count` 与 MongoDB 实际消息数一致，Redis 上下文填充最近若干条
+- `updated_at` 逐条拉开差距（50 分钟前 / 1 天 / 3 天 / 5 天），用于验证侧边栏倒序
+- 含 `tool_calls` 样例，便于验证工具调用渲染
+
+### 3.3 前端交互约定
+
+- **懒创建会话**：点「新建对话」只清空视图，不立即建会话；等用户真正发出第一条消息时才调 `POST /api/sessions`，避免侧边栏堆积空会话
+- **新建会话即新建 thread**：`session_id` 同时作为 LangGraph 的 `thread_id` 传给 Agent，会话间记忆天然隔离
+- **点击会话**：调 `GET /api/sessions/{id}/messages` 拉取完整历史
+- **发消息**：走 `POST /api/chat/stream`，收到 `done` 后本地把该会话移到侧边栏首位并更新计数（不重新拉列表，响应更快）
+- **并发防护**：`useAgentChat` 用递增令牌使过期回调失效，避免「在 A 会话流式输出途中切到 B 会话，A 的增量写进了 B 的列表」
+
+> 时间戳注意：后端 `datetime` 列存的是 naive UTC，序列化后**不带 `Z` 后缀**。前端 `lib/api.ts` 的 `parseUtc` 会补 `Z` 再解析；若不补，东八区会偏差 8 小时（显示"8 小时前"而非"50 分钟前"）。
 
 ---
 
@@ -399,10 +455,36 @@ task_agents/
 │   └── dependencies.py      # FastAPI 依赖注入装配
 └── routers/
     ├── session.py           # /api/sessions*
-    └── chat.py              # /api/chat
+    └── chat.py              # /api/chat、/api/chat/stream
+
+scripts/
+└── seed_demo_data.py        # 演示数据种子脚本（幂等，默认不碰真实数据）
 ```
 
 调用方向严格单向：`router → service → repository`，仓储之间互不调用，事务边界由服务层控制。
+
+### 前端结构
+
+```
+frontend/src/
+├── app/page.tsx                    # 主页面：编排懒创建会话、会话切换
+├── lib/
+│   ├── config.ts                   # user_id 与后端地址（唯一 hardcode 处）
+│   ├── api.ts                      # 接口封装：DTO 适配 + SSE 流解析
+│   └── utils.ts
+├── hooks/
+│   ├── useSessions.ts              # 会话列表：拉取/新建/删除/本地更新
+│   └── useAgentChat.ts             # 消息：流式接收/历史加载/并发防护
+├── components/
+│   ├── layout/Sidebar.tsx          # 侧边栏：列表/骨架屏/空状态/删除
+│   └── chat/
+│       ├── ChatArea.tsx            # 对话区：加载态/错误提示/欢迎页
+│       ├── MessageBubble.tsx       # 消息气泡：Markdown/工具调用/流式态
+│       └── InputArea.tsx
+└── types/index.ts                  # 视图模型 + AGENT_KEY_MAP
+```
+
+前后端字段差异统一在 `lib/api.ts` 消化（如 `session_id` → `id`、ISO 字符串 → 毫秒时间戳），组件层只认前端视图模型，后端 DTO 变更不影响组件。
 
 ---
 
@@ -415,7 +497,12 @@ task_agents/
 3. **查看历史**: 左侧边栏显示所有会话记录
 4. **测试持久化**: 重启后端服务，验证会话和消息仍然存在
 
-> 前端当前仍调用 `POST /chat`（SSE 流式），该接口不参与 MySQL/MongoDB/Redis 持久化。要让侧边栏会话列表与历史加载生效，需把前端切到 `/api/*` 接口：先 `POST /api/sessions` 建会话拿到 `session_id`，再用 `POST /api/chat` 发消息、`GET /api/sessions/{id}/messages` 拉历史。
+前端已完整接入 `/api/*`：侧边栏列表来自 `GET /api/sessions`，点击会话走 `GET /api/sessions/{id}/messages`，发消息走 `POST /api/chat/stream`（流式 + 持久化），新建会话走 `POST /api/sessions`。
+
+尚未完成的部分：
+- **用户登录**：`user_id` 仍为 `frontend/src/lib/config.ts` 中 hardcode 的 `userid_1`，接入登录后改为从登录态取真实 ID 即可，其余代码无需改动
+- **`POST /chat`（旧 SSE 接口）**：已不再被前端调用，仅为兼容保留。该接口不参与任何持久化，可在确认无外部调用方后移除
+- **旧 `sessions` 表**：已被 `chat_sessions` 取代，代码中无任何引用，表内 0 行数据，确认后可 `DROP TABLE sessions;`
 
 ---
 

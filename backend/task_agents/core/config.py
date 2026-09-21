@@ -68,6 +68,20 @@ class Settings(BaseSettings):
     SESSION_PAGE_SIZE: int = 20
     SESSION_PAGE_SIZE_MAX: int = 100
 
+    # ==================== 程序员工具配置 ====================
+    # 程序员子 Agent 的文件读写与代码执行能力，全部受沙箱约束。
+    # 空字符串表示使用默认值：工作区默认为项目下的 workspace/ 目录。
+    CODER_WORKSPACE_DIR: str = ""
+
+    # 代码执行超时（秒）。必须设上限，否则 Agent 写出死循环会挂住整个请求
+    CODER_EXEC_TIMEOUT_SECONDS: int = 15
+
+    # 单次工具输出的最大字符数。防止 Agent 打印海量内容撑爆上下文与 Token
+    CODER_MAX_OUTPUT_CHARS: int = 8000
+
+    # 单文件读写上限（字节）。既是安全防护，也避免误读大文件
+    CODER_MAX_FILE_BYTES: int = 2_000_000
+
     # ==================== 计算属性 ====================
     @property
     def mysql_dsn(self) -> str:
@@ -93,6 +107,21 @@ class Settings(BaseSettings):
         if self.CORS_ORIGINS == "*":
             return ["*"]
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
+
+    @property
+    def coder_workspace_dir(self) -> Path:
+        """程序员子 Agent 的工作区根目录
+
+        未配置 CODER_WORKSPACE_DIR 时，默认落在项目根目录下的 workspace/，
+        与源代码目录隔离，避免 Agent 误改工程文件。
+
+        返回已展开为绝对路径的 Path；目录不存在时由调用方负责创建，
+        这里刻意不产生副作用，保证读取配置是纯函数。
+        """
+        raw = (self.CODER_WORKSPACE_DIR or "").strip()
+        if raw:
+            return Path(raw).expanduser().resolve()
+        return (PROJECT_ROOT / "workspace").resolve()
 
 
 @lru_cache

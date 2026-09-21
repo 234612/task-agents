@@ -1,13 +1,12 @@
 """聊天服务层 — Agent 调用与消息编排
 
-两条调用路径：
+两条调用路径，都会做三存储写入（Redis 同步 / MySQL 同步 / MongoDB 落库）：
 
-1. invoke_chat（新增，服务 POST /api/chat）
-   复用现有 LangGraph Agent，以 ainvoke 取完整回复，然后交给
-   MessageWriteService 做三存储写入（Redis 同步 / MySQL 同步 / MongoDB 异步）。
+1. invoke_chat（服务 POST /api/chat）
+   以 ainvoke 取完整回复后一次性返回。
 
-2. stream_chat（保留，服务 POST /chat）
-   既有 SSE 流式接口，前端 useAgentChat.ts 仍在调用，行为保持不变。
+2. stream_chat_persist（服务 POST /api/chat/stream，前端主链路）
+   以 astream 增量推送 SSE，推送完毕后落库，再下发 done 事件。
 
 记忆机制说明：Agent 使用 MemorySaver（进程内）作为 checkpointer，以
 thread_id=session_id 维持自身对话状态；Redis 上下文是并行的旁路快照，
@@ -16,10 +15,13 @@ thread_id=session_id 维持自身对话状态；Redis 上下文是并行的旁�
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
 from task_agents.schemas.mongo import StoredMessage, ToolCall
 from task_agents.service.message_service import MessageWriteService, TurnRecord
+
+if TYPE_CHECKING:
+    from task_agents.service.session_service import SessionService
 
 logger = logging.getLogger(__name__)
 
@@ -52,21 +54,18 @@ class ChatService:
 
     def __init__(
         self,
-        message_service: Optional[MessageWriteService],
+        message_service: MessageWriteService,
         agent_getter: Any,
+        session_service: "SessionService",
         title_generator: Optional[Any] = None,
-        session_service: Optional[Any] = None,
     ):
         """
         Args:
-            message_service: 三存储写入编排服务。仅 stream_chat（SSE）路径可以为
-                             None，因为该路径不做持久化；invoke_chat 必须提供，
-                             否则会在写入阶段抛出 RuntimeError。
+            message_service: 三存储写入编排服务，负责 Redis/MySQL 同步写入
             agent_getter: 可调用对象，签名 (agent_key) -> CompiledStateGraph
+            session_service: 会话服务，用于在任何写入之前校验会话归属
             title_generator: 可调用对象，签名 (content) -> str，用于 LLM 生成标题；
-                             为 None 时跳过标题生成
-            session_service: SessionService，invoke_chat 用于校验会话归属；
-                             SSE 路径可为 None
+                             为 None 时跳过标题生成（如未配置 API Key）
         """
         self._messages = message_service
         self._agent_getter = agent_getter
@@ -97,16 +96,6 @@ class ChatService:
         Agent 调用失败时直接向上抛出，由 Router 转成 5xx；此时不写任何存储，
         避免落下「有用户消息但没有回复」的半轮对话。
         """
-        if self._messages is None:
-            raise RuntimeError(
-                "invoke_chat 需要 MessageWriteService，当前实例未装配（仅 SSE 流式路径允许为空）"
-            )
-
-        if self._session_service is None:
-            raise RuntimeError(
-                "invoke_chat 需要 SessionService 以校验会话归属，当前实例未装配"
-            )
-
         # —— 1. 归属校验：会话必须存在且属于该用户 ——
         await self.ensure_session_owned(session_id, user_id)
 
@@ -277,64 +266,6 @@ class ChatService:
         logger.info("标题生成完成: session_id=%s title=%s", session_id, title)
         return title
 
-    # ==================== 保留路径：SSE 流式聊天 ====================
-
-    async def stream_chat(
-        self,
-        agent: Any,
-        content: str,
-        session_id: str,
-        user_id: Optional[str] = None,
-    ) -> AsyncIterator[str]:
-        """发起一次流式聊天，yield SSE 格式字符串
-
-        供既有 POST /chat 接口使用（前端 useAgentChat.ts 依赖此格式），
-        行为与原实现保持一致。
-        """
-
-        def format_sse(data: dict) -> str:
-            return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-        try:
-            stream_input = {"messages": [{"role": "user", "content": content}]}
-            stream_config = {
-                "configurable": {
-                    "thread_id": session_id,
-                    "context": {"user_id": user_id or ""},
-                }
-            }
-
-            logger.info("开始流式聊天: user_id=%s session_id=%s", user_id, session_id)
-
-            async for chunk_type, chunk_data in agent.astream(
-                stream_input,
-                stream_config,
-                stream_mode=["messages", "updates"],
-            ):
-                # 模式A：模型回复内容（前端打字机效果）
-                if chunk_type == "messages":
-                    msg = chunk_data[0]
-                    if hasattr(msg, "content") and msg.content:
-                        yield format_sse({"type": "content", "content": msg.content})
-
-                # 模式B：节点状态更新（前端展示思考链）
-                elif chunk_type == "updates":
-                    node_name = list(chunk_data.keys())[0]
-                    if node_name not in ("__start__", "__end__"):
-                        node_output = chunk_data[node_name]
-                        yield format_sse({
-                            "type": "node_update",
-                            "node": node_name,
-                            "data": str(node_output)[:200],
-                        })
-
-            yield format_sse({"type": "done"})
-
-        except Exception as e:
-            logger.exception("流式聊天异常: %s", e)
-            yield format_sse({"type": "error", "message": str(e)})
-
-
     # ==================== 前置校验（供流式路由复用） ====================
 
     async def ensure_session_owned(self, session_id: str, user_id: str) -> None:
@@ -346,12 +277,7 @@ class ChatService:
         Raises:
             SessionNotFoundError: 会话不存在或已软删除
             SessionAccessDeniedError: 会话属于其他用户
-            RuntimeError: 未装配 session_service
         """
-        if self._session_service is None:
-            raise RuntimeError(
-                "ensure_session_owned 需要 SessionService，当前实例未装配"
-            )
         await self._session_service.get_session_for_user(session_id, user_id)
 
     def resolve_agent(self, agent_key: str) -> Any:

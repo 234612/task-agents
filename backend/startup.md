@@ -174,7 +174,6 @@ INFO:     Uvicorn running on http://0.0.0.0:8000
 | DELETE | `/api/sessions/{session_id}?user_id=` | 软删除会话（Mongo 历史保留，Redis 上下文释放） |
 | POST | `/api/chat` | 发送消息，一次性返回完整回复，执行三存储双写 |
 | POST | `/api/chat/stream` | **前端主链路**：SSE 流式推送 + 三存储持久化 |
-| POST | `/chat` | 早期 SSE 接口，仅流式不持久化，保留兼容，新代码勿用 |
 
 `POST /api/chat` 的写入路径：**同步**写 Redis（上下文即时生效）+ **同步**更新 MySQL（`updated_at`、`message_count`）+ **异步**写 MongoDB（`BackgroundTasks`，不阻塞响应）。首轮对话额外在后台由 LLM 生成标题并回写。
 
@@ -332,7 +331,7 @@ netstat -ano | findstr :6379
 - 确保后端服务正在运行
 - 如果前端运行在其他端口，更新 `.env` 中的 `CORS_ORIGINS`
 
-> 前端 `src/hooks/useAgentChat.ts` 调用的是 `POST /chat`（SSE 流式），该接口已保留。若要接入会话列表与历史加载，需改用 `/api/*` 系列接口。
+> 前端 `src/lib/api.ts` 统一调用 `/api/*` 接口：发消息走 `POST /api/chat/stream`（SSE 流式 + 持久化），列表走 `GET /api/sessions`，历史走 `GET /api/sessions/{id}/messages`。若后端地址不是默认的 `localhost:8000`，通过 `NEXT_PUBLIC_API_BASE_URL` 环境变量覆盖。
 
 ### 6. 数据库字符集问题
 
@@ -499,10 +498,12 @@ frontend/src/
 
 前端已完整接入 `/api/*`：侧边栏列表来自 `GET /api/sessions`，点击会话走 `GET /api/sessions/{id}/messages`，发消息走 `POST /api/chat/stream`（流式 + 持久化），新建会话走 `POST /api/sessions`。
 
+已清理的历史包袱：
+- 旧 `POST /chat` 接口与 `ChatService.stream_chat` 方法已移除，聊天能力统一由 `/api/chat` 与 `/api/chat/stream` 提供
+- 旧 `sessions` 表已删除（删除前核对为 0 行），会话元数据统一存于 `chat_sessions`
+
 尚未完成的部分：
 - **用户登录**：`user_id` 仍为 `frontend/src/lib/config.ts` 中 hardcode 的 `userid_1`，接入登录后改为从登录态取真实 ID 即可，其余代码无需改动
-- **`POST /chat`（旧 SSE 接口）**：已不再被前端调用，仅为兼容保留。该接口不参与任何持久化，可在确认无外部调用方后移除
-- **旧 `sessions` 表**：已被 `chat_sessions` 取代，代码中无任何引用，表内 0 行数据，确认后可 `DROP TABLE sessions;`
 
 ---
 

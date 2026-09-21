@@ -4,6 +4,7 @@ from pathlib import Path
 from deepagents import create_deep_agent
 from langchain_core.language_models import BaseChatModel
 
+from task_agents.agent.market_researcher_engine.tools.coding_tools import CODING_TOOLS
 from task_agents.agent.market_researcher_engine.tools.web_research import WEB_RESEARCH_TOOLS
 from task_agents.agent.market_researcher_engine.prompts import MARKET_RESEARCHER_PROMPT
 
@@ -37,6 +38,16 @@ def create_market_researcher(model: BaseChatModel, backend=None, checkpointer=No
             ),
             "system_prompt": _load_prompt("analyst"),
             "tools": [],
+        },
+        {
+            "name": "programmer",
+            "description": (
+                "当任务涉及编写代码、修复 bug、重构、算法实现、"
+                "脚本编写或需要实际运行代码验证结果时调用。"
+                "具备受限的文件读写与 Python 执行能力，产出的代码经过真实运行验证。"
+            ),
+            "system_prompt": _load_prompt("programmer"),
+            "tools": CODING_TOOLS,
         },
     ]
 

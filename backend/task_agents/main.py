@@ -7,18 +7,18 @@ lifespan 中初始化四类资源并挂到 app.state（全应用生命周期复�
 - Redis   client
 - Agent   注册表 + LLM 标题生成器
 
-路由分两组：
-- /api/*   新分层架构（router -> service -> repository），本次需求的主入口
-- /chat    既有 SSE 流式接口，前端 useAgentChat.ts 仍在调用，保留以不断链
+路由统一挂 /api 前缀，走分层架构（router -> service -> repository）：
+- /api/sessions*      会话列表、创建、历史加载、标题、归档、删除
+- /api/chat           发送消息，一次性返回完整回复
+- /api/chat/stream    发送消息，SSE 流式推送（前端主链路）
 """
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 
-from task_agents.agent.factory import build_agents, get_agent_by_key, get_llm_info, verify_llm
+from task_agents.agent.factory import build_agents, get_llm_info, verify_llm
 from task_agents.core.config import get_settings
 from task_agents.database.engine import create_engine, create_session_factory, init_database
 from task_agents.database.mongo import create_mongo_client, get_mongo_database, ping_mongo
@@ -26,8 +26,6 @@ from task_agents.database.redis import create_redis_client, ping_redis
 from task_agents.repository.mongo_message_repository import MongoMessageRepository
 from task_agents.routers.chat import router as chat_router
 from task_agents.routers.session import router as session_router
-from task_agents.schemas.api import ChatRequest
-from task_agents.service.chat_service import ChatService
 from task_agents.service.title_service import build_title_generator
 
 logging.basicConfig(
@@ -126,37 +124,6 @@ app.add_middleware(
 # 新分层架构路由，统一挂 /api 前缀
 app.include_router(session_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
-
-
-# ==================== 既有 SSE 流式接口（前端仍在调用，保留） ====================
-@app.post("/chat", include_in_schema=True, summary="流式聊天（SSE，兼容既有前端）")
-async def chat_stream(request: Request, chat_req: ChatRequest):
-    """SSE 流式聊天接口
-
-    与 POST /api/chat 的区别：本接口以 Server-Sent Events 增量推送回复，
-    供前端打字机效果使用；/api/chat 一次性返回完整回复并执行三存储双写。
-    """
-    try:
-        agent = get_agent_by_key(chat_req.agent_key)
-    except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-
-    # 此路径不参与 MySQL/MongoDB/Redis 持久化，仅依赖 Agent 自身的 checkpointer
-    service = ChatService(
-        message_service=None,
-        agent_getter=get_agent_by_key,
-        title_generator=None,
-    )
-
-    return StreamingResponse(
-        service.stream_chat(
-            agent=agent,
-            content=chat_req.content,
-            session_id=chat_req.session_id,
-            user_id=chat_req.user_id,
-        ),
-        media_type="text/event-stream",
-    )
 
 
 # ==================== 运维接口 ====================

@@ -89,5 +89,9 @@ backend/*.db
 backend/*.sqlite
 backend/*.sqlite3
 
+# 程序员子 Agent 的工作区（LLM 生成的代码产物，不入库）
+# 目录位置由 CODER_WORKSPACE_DIR 配置，默认为 backend/workspace/
+backend/workspace/
+
 # Pip 相关
 backend/pip-wheel-metadata/

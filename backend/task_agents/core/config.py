@@ -28,10 +28,12 @@ class Settings(BaseSettings):
 
     # ==================== LLM 配置 ====================
     # 通义千问 / OpenAI 兼容接口配置
-    LLM_MODEL: str = "qwen3.8-max"
+    LLM_MODEL: str = "qwen3-vl-flash"
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     LLM_TEMPERATURE: float = 0.7
+
+
 
     # ==================== MySQL 配置 ====================
     # 用于存储会话元数据（会话列表、用户隔离）

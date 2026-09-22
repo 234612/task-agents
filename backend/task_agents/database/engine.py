@@ -4,7 +4,7 @@ from task_agents.core.config import Settings
 from task_agents.database.models import Base
 
 
-def create_engine(settings: Settings):
+async def create_engine(settings: Settings):
     """创建 MySQL 异步引擎
 
     pool_pre_ping=True: 连接池健康检查，自动重连断开的连接

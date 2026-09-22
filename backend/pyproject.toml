@@ -17,6 +17,8 @@ dependencies = [
     "cryptography>=42.0.0",
     "motor>=3.3.0",
     "redis>=5.0.0",
+    "langgraph-checkpoint-redis>=0.5.2",
+    "langgraph-store-mongodb>=0.4.0",
 ]
 
 [build-system]

@@ -6,11 +6,11 @@ AsyncSession，由 Service 层控制事务边界（便于跨仓储操作时统�
 import logging
 from typing import Optional
 
-from sqlalchemy import Select, func, select, update
+from sqlalchemy import Select, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from task_agents.core.timeutils import utcnow
-from task_agents.database.models import ChatSession, SessionStatus
+from task_agents.database.models import ChatSession, SessionStatusValue
 
 logger = logging.getLogger(__name__)
 
@@ -28,24 +28,26 @@ class MySQLSessionRepository:
         user_id: str,
         page: int,
         page_size: int,
-        status: SessionStatus = SessionStatus.ACTIVE,
+        status: Optional[int] = None,
     ) -> tuple[list[ChatSession], int]:
         """按用户分页查询会话列表，按最后活跃时间倒序
 
         返回 (当前页记录, 总条数)。
 
+        status=None 表示不限状态（活跃+已结束都返回，前端按状态渲染）；
+        传具体值则精确过滤。
+
         排序走 idx_chat_sessions_user_updated 联合索引：
-        WHERE user_id = ? AND status = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?
+        WHERE user_id = ? [AND status = ?] ORDER BY updated_at DESC LIMIT ? OFFSET ?
         """
         if page < 1:
             raise ValueError("page 必须 >= 1")
         if page_size < 1:
             raise ValueError("page_size 必须 >= 1")
 
-        conditions = [
-            ChatSession.user_id == user_id,
-            ChatSession.status == status,
-        ]
+        conditions = [ChatSession.user_id == user_id]
+        if status is not None:
+            conditions.append(ChatSession.status == status)
 
         total = await self._count(conditions)
 
@@ -60,8 +62,8 @@ class MySQLSessionRepository:
         rows = list(result.scalars().all())
 
         logger.debug(
-            "查询会话列表: user_id=%s page=%s page_size=%s 命中=%s 总数=%s",
-            user_id, page, page_size, len(rows), total,
+            "查询会话列表: user_id=%s page=%s page_size=%s status=%s 命中=%s 总数=%s",
+            user_id, page, page_size, status, len(rows), total,
         )
         return rows, total
 
@@ -75,13 +77,14 @@ class MySQLSessionRepository:
         """判断会话是否存在且属于指定用户
 
         用于权限校验，避免越权读取他人会话的历史消息。
+        已结束的会话（status=2）仍可查看历史，只是不能再追加消息，
+        所以这里不按 status 过滤。
         """
         stmt = (
             select(ChatSession.session_id)
             .where(
                 ChatSession.session_id == session_id,
                 ChatSession.user_id == user_id,
-                ChatSession.status != SessionStatus.DELETED,
             )
             .limit(1)
         )
@@ -153,7 +156,7 @@ class MySQLSessionRepository:
         return affected
 
     async def update_title(self, session_id: str, title: str) -> Optional[ChatSession]:
-        """更新会话标题（LLM 生成标题后回写）"""
+        """更新会话标题"""
         stmt = (
             update(ChatSession)
             .where(ChatSession.session_id == session_id)
@@ -167,18 +170,32 @@ class MySQLSessionRepository:
     async def update_status(
         self,
         session_id: str,
-        status: SessionStatus,
+        status: int,
     ) -> Optional[ChatSession]:
-        """更新会话状态（归档 / 软删除）"""
+        """更新会话状态（1-活跃 / 2-已结束）"""
+        if status not in SessionStatusValue.CHOICES:
+            raise ValueError(f"非法会话状态: {status}")
         stmt = (
             update(ChatSession)
             .where(ChatSession.session_id == session_id)
-            .values(status=status, updated_at=utcnow())
+            .values(status=status)
         )
         result = await self._db.execute(stmt)
         if not result.rowcount:
             return None
         return await self.get_by_id(session_id)
+
+    async def delete(self, session_id: str) -> bool:
+        """物理删除会话记录
+
+        本表刻意不做软删除（见 models.SessionStatusValue 注释）：「已结束」
+        用 status=2 表达，删除即真的从列表里消失。返回是否命中记录。
+        """
+        stmt = delete(ChatSession).where(ChatSession.session_id == session_id)
+        result = await self._db.execute(stmt)
+        deleted = bool(result.rowcount)
+        logger.info("删除会话记录: session_id=%s deleted=%s", session_id, deleted)
+        return deleted
 
     # ==================== 事务控制 ====================
     # 显式暴露提交/回滚，避免 Service 层跨层访问私有 _db 属性。

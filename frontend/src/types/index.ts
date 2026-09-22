@@ -1,4 +1,12 @@
-export type AgentRole = 'researcher' | 'coder' | 'reviewer';
+/**
+ * 前端可选角色（与后端 agent_key 一一对应）
+ *
+ * 2026-09 重构：旧角色 researcher / coder / reviewer 三者都指向同一个后端引擎，
+ * 切换只换头像、行为无差别。现按「任务域」重命名为四个角色，各自绑定独立引擎。
+ * 注意：旧会话库里的 agent_key 仍是 market_researcher，它由「调研」角色继承，
+ * 因此历史会话不会失配。
+ */
+export type AgentRole = 'researcher' | 'developer' | 'writer' | 'analyst';
 
 export interface Agent {
   role: AgentRole;
@@ -36,37 +44,63 @@ export interface ChatSession {
   lastMessageAt: number;
   /** 累计消息条数，来自后端 message_count */
   messageCount?: number;
+  /** 创建该会话时使用的 agent_key，用于回显角色（旧会话也能对上） */
+  agentKey?: string;
 }
 
 export const AGENTS: Agent[] = [
   {
     role: 'researcher',
-    name: '研究员',
+    name: '调研',
     avatar: '🔍',
-    description: '擅长信息检索、资料整理与深度分析',
+    description: '联网查证、竞品与行业调研、产出分析报告',
   },
   {
-    role: 'coder',
-    name: '程序员',
+    role: 'developer',
+    name: '开发',
     avatar: '💻',
-    description: '擅长代码编写、调试与技术实现',
+    description: '架构设计、编码实现与运行验证，代码真跑过再交付',
   },
   {
-    role: 'reviewer',
-    name: '审查员',
-    avatar: '✅',
-    description: '擅长代码审查、质量把控与风险评估',
+    role: 'writer',
+    name: '写作',
+    avatar: '✍️',
+    description: '大纲、正文撰写与审校润色，产出可直接用的成稿',
+  },
+  {
+    role: 'analyst',
+    name: '分析',
+    avatar: '📊',
+    description: '数据清洗、统计建模与图表呈现，结论来自实际计算',
   },
 ];
 
 /**
  * 前端 AgentRole → 后端 agent_key
  *
- * 后端当前只注册了 market_researcher 一个 Agent，三个角色暂时都映射到它。
- * 后续新增 Agent 时，只改这张表即可。
+ * 四个角色各自对应一个独立的主 Agent 引擎（见 backend/task_agents/agent/factory.py）。
+ * 新增引擎时改这张表即可，组件层无需改动。
  */
 export const AGENT_KEY_MAP: Record<AgentRole, string> = {
   researcher: 'market_researcher',
-  coder: 'market_researcher',
-  reviewer: 'market_researcher',
+  developer: 'code_engineer',
+  writer: 'content_writer',
+  analyst: 'data_analyst',
 };
+
+/**
+ * 后端 agent_key → 前端 AgentRole（AGENT_KEY_MAP 的反查表）
+ *
+ * 打开历史会话时用它把会话还原成创建时的角色，避免用当前选中的角色
+ * 去读另一个引擎的 thread。未知 key 一律回落到「调研」。
+ */
+export const AGENT_ROLE_BY_KEY: Record<string, AgentRole> = Object.entries(
+  AGENT_KEY_MAP
+).reduce<Record<string, AgentRole>>((acc, [role, key]) => {
+  acc[key] = role as AgentRole;
+  return acc;
+}, {});
+
+export function roleOfAgentKey(agentKey?: string): AgentRole {
+  return (agentKey && AGENT_ROLE_BY_KEY[agentKey]) || 'researcher';
+}

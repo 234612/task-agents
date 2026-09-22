@@ -19,6 +19,10 @@ dependencies = [
     "redis>=5.0.0",
     "langgraph-checkpoint-redis>=0.5.2",
     "langgraph-store-mongodb>=0.4.0",
+    # data_analyst 引擎依赖：清洗取数 / 出图 / 读取 Excel
+    "pandas>=2.2.0",
+    "matplotlib>=3.9.0",
+    "openpyxl>=3.1.0",
 ]
 
 [build-system]

@@ -19,7 +19,7 @@ from typing import Any, Optional
 from task_agents.repository.mongo_message_repository import MongoMessageRepository
 from task_agents.repository.mysql_session_repository import MySQLSessionRepository
 from task_agents.repository.redis_context_repository import RedisContextRepository
-from task_agents.schemas.mongo import StoredMessage, ToolCall
+from task_agents.schemas.mongo import Citation, StoredMessage, ThinkingStep, ToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +92,15 @@ class MessageWriteService:
         user_content: str,
         assistant_content: str,
         assistant_tool_calls: Optional[list[ToolCall]] = None,
+        assistant_thinking_steps: Optional[list[ThinkingStep]] = None,
+        assistant_citations: Optional[list[Citation]] = None,
     ) -> TurnRecord:
         """记录一轮对话（user + assistant）
 
         同步完成 Redis 与 MySQL 写入，返回待异步落库的消息列表。
+        thinking_steps / citations 只随 assistant 消息落 MongoDB
+        （长期记忆层），不写 Redis——短期记忆只服务 Prompt 注入，
+        思考链对下一轮回答没有价值，放进窗口只会浪费 Token。
 
         调用方拿到返回值后应立刻调度后台任务写 MongoDB：
             background_tasks.add_task(write_messages_to_mongo, ...)
@@ -111,6 +116,8 @@ class MessageWriteService:
             role="assistant",
             content=assistant_content,
             tool_calls=assistant_tool_calls or [],
+            thinking_steps=assistant_thinking_steps or [],
+            citations=assistant_citations or [],
         )
         turn = TurnRecord(
             session_id=session_id,

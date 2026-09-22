@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     LLM_TEMPERATURE: float = 0.7
 
+    # 单次请求内 LangGraph 允许的最大步数（防失控）。
+    # 小模型偶尔会陷入「重复委派 / 反复重试失败工具」的死循环，一条请求能跑
+    # 上千步、烧掉几十万 token。设上限后可被 GraphRecursionError 截断，
+    # 由 chat_service 转成 error 事件返回，而不是无限跑下去。
+    AGENT_RECURSION_LIMIT: int = 60
+
 
 
     # ==================== MySQL 配置 ====================
@@ -57,9 +63,21 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: str = ""
 
     # 上下文窗口：保留最近 N 轮对话（1 轮 = user + assistant 各一条消息）
-    REDIS_CONTEXT_MAX_TURNS: int = 10
-    # 上下文 TTL（秒），默认 7 天；到期自动过期，无需手动清理
-    REDIS_CONTEXT_TTL_SECONDS: int = 604800
+    # 3 轮 = 6 条消息，控制 Prompt 注入的 Token 规模
+    REDIS_CONTEXT_MAX_TURNS: int = 3
+    # 上下文 TTL（秒），默认 1 小时；非活跃会话自动过期，与 checkpointer
+    # 的 1 小时 TTL 对齐，两层短期记忆同生同灭
+    REDIS_CONTEXT_TTL_SECONDS: int = 3600
+
+    # LangGraph checkpointer（短期记忆）后端：auto / redis / memory
+    # - auto（默认）：探测 Redis 是否装了 RedisJSON；有则用 Redis，无则回落内存
+    # - redis：强制用 Redis（要求 Redis Stack / Redis 8，含 RedisJSON + RediSearch）
+    # - memory：进程内内存，服务重启后 thread 状态丢失（业务侧 Redis 上下文
+    #   仍在，冷启动由 _seed_context 回灌，只是 LangGraph 侧的 state 重建）
+    CHECKPOINT_BACKEND: str = "auto"
+
+    # 会话标题：取首句前 N 字（标题截断长度）
+    SESSION_TITLE_MAX_CHARS: int = 50
 
     # ==================== 应用配置 ====================
     # FastAPI 服务配置

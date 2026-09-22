@@ -5,17 +5,18 @@ from pathlib import Path
 from deepagents import create_deep_agent, SubAgent
 from langchain_core.language_models import BaseChatModel
 
+from task_agents.agent.leaf_rules import LEAF_AGENT_RULES
 from task_agents.agent.market_researcher_engine.prompts import MARKET_RESEARCHER_PROMPT
 from task_agents.agent.market_researcher_engine.tools.coding_tools import CODING_TOOLS
 from task_agents.agent.market_researcher_engine.tools.web_research import WEB_RESEARCH_TOOLS
 
 
 def _load_prompt(name: str) -> str:
-    """从 subagents/{name}/prompt.md 加载提示词"""
+    """从 subagents/{name}/prompt.md 加载提示词（并追加叶子 Agent 约束）"""
     prompt_path = Path(__file__).parent / "subagents" / name / "prompt.md"
     if not prompt_path.exists():
         raise FileNotFoundError(f"找不到子 Agent 提示词: {prompt_path}")
-    return prompt_path.read_text(encoding="utf-8")
+    return prompt_path.read_text(encoding="utf-8") + LEAF_AGENT_RULES
 
 
 def create_market_researcher(model: BaseChatModel, backend=None, store=None,memory=None, checkpointer=None):

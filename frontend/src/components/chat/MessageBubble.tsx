@@ -60,20 +60,28 @@ export function MessageBubble({ message }: MessageBubbleProps) {
             remarkPlugins={[remarkGfm]}
             components={{
               code({ className, children, ...props }) {
-                const isInline = !className;
+                // 注意：react-markdown v9 中无语言标注的围栏代码块（```）不会带
+                // className，不能用 !className 判断行内代码，否则整块代码会误套
+                // 行内的浅色样式，嵌进深色 pre 里变成"白底浅字"看不清。
+                // 因此额外把"含换行"的内容视为块级代码。
+                const text = String(children ?? '');
+                const isInline = !className && !text.includes('\n');
                 return isInline ? (
-                  <code className="rounded bg-slate-100 px-1.5 py-0.5 text-xs" {...props}>
+                  <code
+                    className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-700"
+                    {...props}
+                  >
                     {children}
                   </code>
                 ) : (
-                  <code className={className} {...props}>
+                  <code className={cn('font-mono', className)} {...props}>
                     {children}
                   </code>
                 );
               },
               pre({ children }) {
                 return (
-                  <pre className="my-2 overflow-x-auto rounded-lg bg-slate-900 p-3 text-xs text-slate-100">
+                  <pre className="my-2 overflow-x-auto rounded-lg bg-slate-900 p-3 text-xs leading-relaxed text-slate-100 [&_code]:block [&_code]:bg-transparent [&_code]:p-0 [&_code]:text-inherit">
                     {children}
                   </pre>
                 );

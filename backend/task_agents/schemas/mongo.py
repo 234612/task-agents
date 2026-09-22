@@ -42,12 +42,41 @@ class ToolCall(BaseModel):
     args: dict[str, Any] = Field(default_factory=dict, description="工具入参")
 
 
+class ThinkingStep(BaseModel):
+    """Agent 思考步骤
+
+    记录节点级的执行过程（进入某个图节点、子 Agent 委派等），
+    供前端展示思考链。内容做截断，避免大对象撑爆文档。
+    """
+    model_config = ConfigDict(extra="allow")
+
+    node: str = Field(description="产生该步骤的图节点名")
+    summary: str = Field(default="", description="步骤摘要（截断后的可读文本）")
+    ts: datetime = Field(default_factory=utcnow, description="步骤产生时间（UTC）")
+
+
+class Citation(BaseModel):
+    """引用来源
+
+    为联网检索类回答预留的结构化引用位：搜索引擎结果、网页内容等
+    可整理为 {title, url, snippet} 落库，前端渲染为参考链接。
+    """
+    model_config = ConfigDict(extra="allow")
+
+    title: str = Field(default="", description="来源标题")
+    url: str = Field(default="", description="来源链接")
+    snippet: str = Field(default="", description="引用片段")
+
+
 class StoredMessage(BaseModel):
     """messages 数组中的单条消息
 
     seq 为会话内单调递增序号，从 1 开始，用于：
     - 保证消息展示顺序稳定（不依赖 ts 的精度或时钟漂移）
     - 支持「从第 N 条之后增量拉取」的分页场景
+
+    thinking_steps / citations 是长期记忆层为后续扩展预留的字段：
+    用户画像、跨会话记忆等可继续以文档内嵌结构追加，无需迁移 Schema。
     """
     model_config = ConfigDict(extra="allow")
 
@@ -55,6 +84,8 @@ class StoredMessage(BaseModel):
     role: MessageRole = Field(description="消息角色")
     content: str = Field(default="", description="消息正文")
     tool_calls: list[ToolCall] = Field(default_factory=list, description="工具调用记录")
+    thinking_steps: list[ThinkingStep] = Field(default_factory=list, description="思考步骤")
+    citations: list[Citation] = Field(default_factory=list, description="引用来源")
     ts: datetime = Field(default_factory=utcnow, description="消息产生时间（UTC）")
 
 

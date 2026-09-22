@@ -1,12 +1,15 @@
 """SQLAlchemy ORM 模型定义
 
-分层存储中 MySQL 只承担「会话元数据」职责，服务于侧边栏列表页的
-排序、分页与筛选。对话正文（messages 数组）不落在 MySQL，见
+分层存储中 MySQL 只承担「会话业务」职责，服务于左侧会话列表的
+排序、分页与权限校验。对话正文（messages 数组）不落在 MySQL，见
 task_agents/schemas/mongo.py。
-"""
-import enum
 
-from sqlalchemy import BigInteger, Column, DateTime, Enum, Index, String
+存储分工（对齐三层记忆架构）：
+- MySQL   chat_sessions 会话元数据（业务层）
+- Redis   短期记忆（当前会话上下文滑动窗口 + LangGraph checkpointer）
+- MongoDB 长期记忆（消息内容、思考步骤、工具调用、引用来源）
+"""
+from sqlalchemy import BigInteger, Column, DateTime, Index, Integer, String
 from sqlalchemy.orm import DeclarativeBase
 
 from task_agents.core.timeutils import utcnow
@@ -17,14 +20,23 @@ class Base(DeclarativeBase):
     pass
 
 
-class SessionStatus(str, enum.Enum):
-    """会话状态
+class SessionStatusValue:
+    """会话状态常量
 
-    继承 str 以便直接参与 JSON 序列化与 Pydantic 校验。
+    使用整型而非字符串枚举：与业务层惯例（1-活跃 / 2-已结束）对齐，
+    索引存储更紧凑，前端无需再做枚举映射。
+
+    刻意不做软删除：status=2 表示「已结束」，会话仍出现在列表里
+    （由前端灰显等），只有数据治理任务才会物理清理。
     """
-    ACTIVE = "active"        # 进行中，默认状态
-    ARCHIVED = "archived"    # 用户归档，不出现在默认列表
-    DELETED = "deleted"      # 软删除，保留行以便审计与恢复
+    ACTIVE = 1      # 活跃：默认状态
+    ENDED = 2       # 已结束：用户主动结束会话，停止追加消息
+
+    CHOICES = (ACTIVE, ENDED)
+
+    @classmethod
+    def label(cls, value: int) -> str:
+        return {cls.ACTIVE: "active", cls.ENDED: "ended"}.get(value, "unknown")
 
 
 class ChatSession(Base):
@@ -35,11 +47,11 @@ class ChatSession(Base):
     """
     __tablename__ = "chat_sessions"
 
-    # 主键：UUID 字符串，跨存储引擎（MySQL / MongoDB / Redis）共用同一标识
+    # 主键：UUID v4（36 字符），跨存储引擎（MySQL / MongoDB / Redis）共用同一标识
     session_id = Column(
         String(36),
         primary_key=True,
-        comment="会话唯一标识（UUID）",
+        comment="会话唯一标识（UUID v4，36 字符）",
     )
 
     # 用户 ID：会话隔离的边界
@@ -49,11 +61,11 @@ class ChatSession(Base):
         comment="所属用户 ID",
     )
 
-    # 会话标题：由 LLM 依据首轮对话自动生成，生成前用占位标题
+    # 会话标题：首句前 50 字（服务端截取，不调 LLM）
     title = Column(
         String(256),
         nullable=False,
-        comment="会话标题（LLM 自动生成）",
+        comment="会话标题（首句前 50 字）",
     )
 
     # Agent 标识：沿用既有前端契约，如 market_researcher
@@ -63,13 +75,13 @@ class ChatSession(Base):
         comment="使用的 agent 标识",
     )
 
-    # 状态：默认 active；列表查询会过滤掉 deleted
+    # 状态：1-活跃 2-已结束（Integer + 应用层常量校验，见 SessionStatusValue）
     status = Column(
-        Enum(SessionStatus, values_callable=lambda e: [m.value for m in e]),
+        Integer,
         nullable=False,
-        default=SessionStatus.ACTIVE,
-        server_default=SessionStatus.ACTIVE.value,
-        comment="会话状态",
+        default=SessionStatusValue.ACTIVE,
+        server_default=str(SessionStatusValue.ACTIVE),
+        comment="会话状态：1-活跃 2-已结束",
     )
 
     # 消息条数：由聊天接口在每次落库时原子自增，避免 COUNT(*) 扫 MongoDB
@@ -78,7 +90,7 @@ class ChatSession(Base):
         nullable=False,
         default=0,
         server_default="0",
-        comment="累计消息条数",
+        comment="累计消息条数（冗余字段，避免 COUNT）",
     )
 
     # 时间戳：updated_at 即「最后活跃时间」，是列表排序依据
@@ -114,7 +126,7 @@ class ChatSession(Base):
             "user_id": self.user_id,
             "title": self.title,
             "agent_key": self.agent_key,
-            "status": self.status.value if isinstance(self.status, SessionStatus) else self.status,
+            "status": int(self.status),
             "message_count": self.message_count,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

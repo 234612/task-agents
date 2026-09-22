@@ -1,23 +1,42 @@
-"""聊天服务层 — Agent 调用与消息编排
+"""聊天服务层 — Agent 调用、SSE 事件协议与三层记忆编排
 
-两条调用路径，都会做三存储写入（Redis 同步 / MySQL 同步 / MongoDB 落库）：
+两条调用路径，都完成「Redis 短期 / MySQL 业务 / MongoDB 长期」三写：
 
 1. invoke_chat（服务 POST /api/chat）
-   以 ainvoke 取完整回复后一次性返回。
+   ainvoke 取完整回复后一次性返回。
 
 2. stream_chat_persist（服务 POST /api/chat/stream，前端主链路）
-   以 astream 增量推送 SSE，推送完毕后落库，再下发 done 事件。
+   astream 增量推送 SSE，推送完毕后落库，再下发 done 事件。
 
-记忆机制说明：Agent 使用 MemorySaver（进程内）作为 checkpointer，以
-thread_id=session_id 维持自身对话状态；Redis 上下文是并行的旁路快照，
-用于为后续 Prompt 注入提供低延迟读取，二者互不替代。
+SSE 事件协议（所有帧均为 data: {JSON}，type 字段区分）：
+- meta         流开始时首帧下发：{session_id, created}，首次对话由后端
+               自动生成的会话 ID 通过它回传前端
+- content      模型回复增量：{content}
+- thinking     图节点执行步骤：{node, summary}，前端渲染思考链
+- tool_call    工具调用发起：{id, name, args}
+- tool_result  工具执行结果：{tool_call_id, name, content}
+- done         流结束：{persisted, message_count, session_id}
+               —— 持久化完成后才发送，前端收到即可安全刷新列表/历史
+- error        流内错误：{message}
+
+三层记忆接线：
+- RedisSaver checkpointer（thread_id=session_id）是 Agent 的进程外短期记忆；
+- 业务侧 Redis 滑动窗口（memory:context:*）在 checkpointer 冷启动
+  （Key 过期 / 服务重启）时回灌上下文到 state，见 _seed_context；
+- MongoDBStore 承载跨会话长期记忆（由 deepagents backend 接入，本层不直接读写）。
 """
 import json
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
-from task_agents.schemas.mongo import StoredMessage, ToolCall
+from task_agents.core.config import get_settings
+from task_agents.schemas.mongo import (
+    Citation,
+    StoredMessage,
+    ThinkingStep,
+    ToolCall,
+)
 from task_agents.service.message_service import MessageWriteService, TurnRecord
 
 if TYPE_CHECKING:
@@ -25,20 +44,35 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 工具结果写入思考链时的截断长度：防止大段网页正文撑爆 SSE 帧与文档
+_STEP_SUMMARY_LIMIT = 200
+_TOOL_RESULT_PREVIEW_LIMIT = 500
+
 
 class AgentNotFoundError(Exception):
     """指定的 agent_key 未注册"""
+
+
+class SessionEndedHTTPError(Exception):
+    """会话已结束（status=2）仍尝试追加消息。Router 转 409。"""
 
 
 @dataclass
 class ChatTurnResult:
     """一次聊天的处理结果，供 Router 层组装响应与调度后台任务"""
     session_id: str
+    created: bool
     user_message: StoredMessage
     assistant_message: StoredMessage
     message_count: Optional[int]
-    is_first_turn: bool = False
     tool_calls: list[ToolCall] = field(default_factory=list)
+    thinking_steps: list[ThinkingStep] = field(default_factory=list)
+    citations: list[Citation] = field(default_factory=list)
+
+    @property
+    def is_first_turn(self) -> bool:
+        """本结果对应的那条用户消息是否为会话首条"""
+        return self.user_message.seq == 1
 
     @property
     def pending_messages(self) -> list[StoredMessage]:
@@ -57,61 +91,83 @@ class ChatService:
         message_service: MessageWriteService,
         agent_getter: Any,
         session_service: "SessionService",
-        title_generator: Optional[Any] = None,
     ):
         """
         Args:
-            message_service: 三存储写入编排服务，负责 Redis/MySQL 同步写入
+            message_service: 三存储写入编排服务
             agent_getter: 可调用对象，签名 (agent_key) -> CompiledStateGraph
-            session_service: 会话服务，用于在任何写入之前校验会话归属
-            title_generator: 可调用对象，签名 (content) -> str，用于 LLM 生成标题；
-                             为 None 时跳过标题生成（如未配置 API Key）
+            session_service: 会话服务。负责会话隔离——首次对话自动建会话，
+                             续聊校验归属与状态——必须在任何写入之前完成
         """
         self._messages = message_service
         self._agent_getter = agent_getter
-        self._title_generator = title_generator
         self._session_service = session_service
+
+    # ==================== 会话隔离入口 ====================
+
+    async def prepare_session(
+        self,
+        user_id: str,
+        agent_key: str,
+        session_id: Optional[str],
+        first_message: str,
+    ) -> tuple[str, bool]:
+        """会话隔离：校验续聊会话或为首次对话自动创建
+
+        必须在生成任何响应（含 SSE 首帧）之前调用：403/404/409 只能在
+        HTTP 状态码阶段表达，流一旦开始就固定为 200 了。
+
+        Returns:
+            (session_id, created) —— created=True 表示本次新建
+        """
+        session = await self._session_service.ensure_session(
+            user_id=user_id,
+            agent_key=agent_key,
+            session_id=session_id,
+            first_message=first_message,
+        )
+        return session.session_id, int(session.message_count) == 0 and session_id is None
+
+    def resolve_agent(self, agent_key: str) -> Any:
+        """按 key 获取 Agent 实例
+
+        Raises:
+            AgentNotFoundError: agent_key 未注册
+        """
+        try:
+            return self._agent_getter(agent_key)
+        except KeyError as e:
+            raise AgentNotFoundError(str(e)) from e
 
     # ==================== 主路径：同步调用 Agent ====================
 
     async def invoke_chat(
         self,
-        session_id: str,
         user_id: str,
         agent_key: str,
         content: str,
+        session_id: Optional[str],
     ) -> ChatTurnResult:
         """调用 Agent 生成回复并完成三存储写入
 
-        流程：
-        1. 校验会话存在且归属当前用户（越权则抛 SessionAccessDeniedError）
-        2. 取 Agent 实例（未注册则抛 AgentNotFoundError）
-        3. 判定是否首轮（用于决定是否触发标题生成）
-        4. ainvoke 取完整回复，解析正文与工具调用
-        5. 交给 MessageWriteService 写 Redis + MySQL，返回待落 Mongo 的消息
-
-        归属校验必须在任何写入之前完成，否则任意用户拿到他人 session_id 就能
-        往其会话里写消息，造成数据污染与隐私泄露。
-
-        Agent 调用失败时直接向上抛出，由 Router 转成 5xx；此时不写任何存储，
-        避免落下「有用户消息但没有回复」的半轮对话。
+        流程：会话隔离 → 取 Agent → 冷启动回灌上下文 → ainvoke → 持久化。
+        Agent 调用失败时直接向上抛出，由 Router 转成 5xx；此时不写任何
+        存储，避免落下「有用户消息但没有回复」的半轮对话。
         """
-        # —— 1. 归属校验：会话必须存在且属于该用户 ——
-        await self.ensure_session_owned(session_id, user_id)
-
+        final_session_id, created = await self.prepare_session(
+            user_id, agent_key, session_id, content
+        )
         agent = self.resolve_agent(agent_key)
 
-        is_first_turn = await self._is_first_turn(session_id)
-
         logger.info(
-            "开始调用 Agent: session_id=%s user_id=%s agent_key=%s 首轮=%s",
-            session_id, user_id, agent_key, is_first_turn,
+            "开始调用 Agent: session_id=%s user_id=%s agent_key=%s 新建=%s",
+            final_session_id, user_id, agent_key, created,
         )
 
-        reply_text, tool_calls = await self._invoke_agent(agent, session_id, user_id, content)
+        reply_text, tool_calls = await self._invoke_agent(agent, final_session_id, user_id, content)
 
         turn: TurnRecord = await self._messages.record_turn(
-            session_id=session_id,
+            session_id=final_session_id,
             user_id=user_id,
             user_content=content,
             assistant_content=reply_text,
@@ -120,26 +176,17 @@ class ChatService:
 
         logger.info(
             "Agent 回复已写入 Redis+MySQL: session_id=%s 回复长度=%s 工具调用=%s",
-            session_id, len(reply_text), len(tool_calls),
+            final_session_id, len(reply_text), len(tool_calls),
         )
 
         return ChatTurnResult(
-            session_id=session_id,
+            session_id=final_session_id,
+            created=created,
             user_message=turn.user_message,
             assistant_message=turn.assistant_message,
             message_count=turn.message_count,
-            is_first_turn=is_first_turn,
             tool_calls=tool_calls,
         )
-
-    async def _is_first_turn(self, session_id: str) -> bool:
-        """判断本轮是否为会话首轮（首轮才需要生成标题）
-
-        以 MySQL message_count 为准而非 Redis 上下文长度：Redis 有 TTL 且属于
-        可失效的加速层，过期或故障时长度会变 0，导致老会话被误判为首轮并重复
-        覆盖已由 LLM 生成的标题。
-        """
-        return await self._messages.message_count(session_id) == 0
 
     async def _invoke_agent(
         self,
@@ -149,16 +196,10 @@ class ChatService:
         content: str,
     ) -> tuple[str, list[ToolCall]]:
         """调用 Agent 并解析回复正文与工具调用"""
-        stream_input = {"messages": [{"role": "user", "content": content}]}
-        stream_config = {
-            "configurable": {
-                # thread_id 与 session_id 一致，Agent 侧记忆按会话隔离
-                "thread_id": session_id,
-                "context": {"user_id": user_id},
-            }
-        }
+        messages = await self._seed_context(session_id, content)
+        stream_config = self._thread_config(session_id, user_id)
 
-        result = await agent.ainvoke(stream_input, stream_config)
+        result = await agent.ainvoke({"messages": messages}, stream_config)
         last_message = self._last_message(result)
 
         if last_message is None:
@@ -170,15 +211,252 @@ class ChatService:
             self._extract_tool_calls(self._get_field(last_message, "tool_calls")),
         )
 
+    # ==================== 短期记忆：上下文注入 ====================
+
+    async def _seed_context(self, session_id: str, content: str) -> list[dict]:
+        """构造本次调用的消息输入：当前消息 + （冷启动时）Redis 窗口回灌
+
+        分工：RedisSaver checkpointer 持有 thread 的完整历史，正常续聊时
+        LangGraph 会自动恢复 state，这里只需传新消息。但 checkpointer 的
+        Key 有 1 小时 TTL，过期或服务重启后 thread 是「冷」的——此时若不
+        回灌，Agent 会失忆。业务侧 Redis 滑动窗口（同样是最近 N 条）恰好
+        是廉价的热备份：检测冷启动后，把窗口内的历史拼进输入。
+
+        冷启动判定直接查 checkpointer.aget_tuple 返回是否为 None，
+        而不是猜 TTL 时间——重启后内存清空但 Key 仍在，只有真查才算准。
+
+        注意窗口与当前消息的重叠问题：本轮 user 消息在「对话结束后」才
+        append 回 Redis（见 record_turn），所以读取窗口时当前消息尚未写入，
+        直接拼接不会重复。
+        """
+        current = {"role": "user", "content": content}
+
+        context: list[StoredMessage] = []
+        try:
+            if await self._is_thread_cold(session_id):
+                context = await self._messages.load_context(session_id)
+        except Exception as e:
+            # 上下文注入是增强而非依赖：失败只降级为「无历史」，不阻断对话
+            logger.warning("冷启动上下文回灌失败，按无历史继续: session_id=%s error=%s", session_id, e)
+            context = []
+
+        seeded: list[dict] = []
+        for msg in context:
+            if msg.role not in ("user", "assistant") or not msg.content:
+                continue
+            seeded.append({"role": msg.role, "content": msg.content})
+        seeded.append(current)
+        return seeded
+
+    async def _is_thread_cold(self, session_id: str) -> bool:
+        """checkpointer 中是否还没有该 thread 的存档
+
+        查不到 checkpointer 时按「不冷」处理——注入与否是优化，
+        checkpointer 本身通常完好，不该因探测能力缺失改变主流程。
+        """
+        checkpointer = getattr(self, "_checkpointer", None)
+        if checkpointer is None:
+            return False
+        try:
+            tup = await checkpointer.aget_tuple({"configurable": {"thread_id": session_id}})
+        except Exception as e:
+            logger.warning("检查 thread 冷启动失败，按热处理: session_id=%s error=%s", session_id, e)
+            return False
+        return tup is None
+
+    @staticmethod
+    def _thread_config(session_id: str, user_id: str) -> dict:
+        """LangGraph 运行配置：thread_id 与 session_id 一致，会话隔离
+
+        recursion_limit 是防失控闸门：小模型可能陷入「重复委派 / 反复重试
+        失败工具」的循环，不加限制一条请求能跑上千步。超出后 LangGraph 抛
+        GraphRecursionError，被 stream 的 except 捕获成 error 事件返回。
+        """
+        return {
+            "configurable": {
+                "thread_id": session_id,
+                "context": {"user_id": user_id},
+            },
+            "recursion_limit": get_settings().AGENT_RECURSION_LIMIT,
+        }
+
+    # ==================== 流式 + 持久化（前端主链路） ====================
+
+    async def stream_chat_persist(
+        self,
+        agent: Any,
+        content: str,
+        session_id: str,
+        user_id: str,
+        created: bool,
+        on_complete: Any,
+    ) -> AsyncIterator[str]:
+        """流式聊天并在结束后持久化，yield SSE 格式字符串
+
+        事件时序：meta → (content | thinking | tool_call | tool_result)*
+        → done。done 必须在持久化完成之后发送——前端收到 done 会立刻
+        刷新列表/历史，落库未完成就读会丢消息。done 携带 persisted 与
+        message_count，供前端直接更新本地状态。
+
+        客户端中途断连时不持久化半截回复（completed 标志位控制），
+        避免落库一条没有结尾的助手消息。
+
+        Args:
+            on_complete: 异步回调，签名
+                (assistant_text, tool_calls, thinking_steps) -> Optional[int]，
+                返回最新 message_count。由路由层注入 persist_turn，
+                使服务层不依赖 FastAPI 的 app 对象。
+        """
+        # —— 首帧：会话元数据（自动创建的 session_id 通过它回传前端） ——
+        yield _format_sse({
+            "type": "meta",
+            "session_id": session_id,
+            "created": created,
+        })
+
+        accumulated = ""
+        tool_calls: list[ToolCall] = []
+        thinking_steps: list[ThinkingStep] = []
+        citations: list[Citation] = []
+        seen_tool_call_ids: set[str] = set()
+        completed = False
+
+        try:
+            messages = await self._seed_context(session_id, content)
+            stream_config = self._thread_config(session_id, user_id)
+
+            logger.info(
+                "开始流式聊天(持久化): user_id=%s session_id=%s 回灌消息=%s",
+                user_id, session_id, len(messages) - 1,
+            )
+
+            async for chunk_type, chunk_data in agent.astream(
+                {"messages": messages},
+                stream_config,
+                stream_mode=["messages", "updates"],
+            ):
+                # —— content：模型 token 增量（打字机效果） ——
+                if chunk_type == "messages":
+                    msg = chunk_data[0]
+                    piece = self._extract_text(self._get_field(msg, "content"))
+                    if piece:
+                        # 累积口径与前端展示完全一致，保证「看到的」=「落库的」
+                        accumulated += piece
+                        yield _format_sse({"type": "content", "content": piece})
+
+                # —— updates：节点产物 → thinking / tool_call / tool_result ——
+                elif chunk_type == "updates":
+                    for evt in self._parse_node_update(chunk_data):
+                        if evt["type"] == "tool_call":
+                            calls = evt["_calls"]
+                            # messages 模式里模型分片可能重复携带同一批
+                            # tool_calls，按 id 去重后再累计
+                            for call in calls:
+                                key = call.id or f"{call.name}:{json.dumps(call.args, sort_keys=True, default=str)[:80]}"
+                                if key not in seen_tool_call_ids:
+                                    seen_tool_call_ids.add(key)
+                                    tool_calls.append(call)
+                                    if call.name == "extract_web_content" and call.args.get("url"):
+                                        citations.append(_citation_from_url(str(call.args["url"])))
+                            yield _format_sse({
+                                "type": "tool_call",
+                                "id": [c.id for c in calls],
+                                "name": [c.name for c in calls],
+                                "args": [c.args for c in calls],
+                            })
+                        else:
+                            if evt["type"] == "thinking":
+                                thinking_steps.append(
+                                    ThinkingStep(node=evt["node"], summary=evt["summary"])
+                                )
+                            yield _format_sse(evt)
+
+            completed = True
+
+        except Exception as e:
+            logger.exception("流式聊天异常: session_id=%s", session_id)
+            yield _format_sse({"type": "error", "message": str(e)})
+            return
+
+        if not completed:
+            return
+
+        # —— 流式推送完毕，执行三存储持久化 ——
+        message_count: Optional[int] = None
+        persisted = True
+        try:
+            message_count = await on_complete(accumulated, tool_calls, thinking_steps, citations)
+            persisted = message_count is not None
+        except Exception:
+            logger.exception("流式对话持久化失败: session_id=%s", session_id)
+            persisted = False
+
+        if not persisted:
+            logger.error(
+                "回复已推送但持久化失败，历史中可能缺失本轮: session_id=%s", session_id
+            )
+
+        yield _format_sse({
+            "type": "done",
+            "persisted": persisted,
+            "message_count": message_count,
+            "session_id": session_id,
+        })
+
+    @staticmethod
+    def _parse_node_update(chunk_data: Any) -> list[dict]:
+        """把一个 updates 节点产物解析为 0..n 个 SSE 事件
+
+        节点输出 {"messages": [...]} 中可能包含：
+        - AIMessage(tool_calls=[...]) → tool_call 事件
+        - ToolMessage → tool_result 事件
+        其余状态更新（非消息键）→ thinking 事件。
+        """
+        events: list[dict] = []
+        if not isinstance(chunk_data, dict):
+            return events
+
+        for node_name, node_output in chunk_data.items():
+            if node_name in ("__start__", "__end__"):
+                continue
+
+            node_messages = node_output.get("messages") if isinstance(node_output, dict) else None
+            if node_messages:
+                for msg in node_messages:
+                    msg_type = type(msg).__name__
+                    calls = ChatService._extract_tool_calls(ChatService._get_field(msg, "tool_calls"))
+                    if calls:
+                        events.append({"type": "tool_call", "_calls": calls})
+                    elif msg_type == "ToolMessage":
+                        events.append({
+                            "type": "tool_result",
+                            "tool_call_id": ChatService._get_field(msg, "tool_call_id"),
+                            "name": ChatService._get_field(msg, "name"),
+                            "content": ChatService._extract_text(
+                                ChatService._get_field(msg, "content")
+                            )[:_TOOL_RESULT_PREVIEW_LIMIT],
+                        })
+                    else:
+                        text = ChatService._extract_text(ChatService._get_field(msg, "content"))
+                        if text.strip():
+                            events.append({
+                                "type": "thinking",
+                                "node": node_name,
+                                "summary": text[:_STEP_SUMMARY_LIMIT],
+                            })
+            else:
+                events.append({
+                    "type": "thinking",
+                    "node": node_name,
+                    "summary": str(node_output)[:_STEP_SUMMARY_LIMIT],
+                })
+        return events
+
     # ==================== 回复解析辅助 ====================
 
     @staticmethod
     def _last_message(result: Any) -> Optional[Any]:
-        """从 Agent 返回值中取出最后一条消息
-
-        LangGraph 的 ainvoke 返回状态字典，消息在 "messages" 键下；
-        这里对非字典返回也做兜底，避免 Agent 实现变化时直接崩溃。
-        """
+        """从 Agent 返回值中取出最后一条消息"""
         if not isinstance(result, dict):
             return None
         messages = result.get("messages")
@@ -221,9 +499,7 @@ class ChatService:
     @staticmethod
     def _extract_tool_calls(raw: Any) -> list[ToolCall]:
         """把 Agent 产出的工具调用转换为落库模型"""
-        if not raw:
-            return []
-        if not isinstance(raw, list):
+        if not raw or not isinstance(raw, list):
             return []
 
         calls: list[ToolCall] = []
@@ -241,170 +517,26 @@ class ChatService:
                 )
         return calls
 
-    # ==================== 后台任务：LLM 生成标题 ====================
 
-    async def generate_title(self, session_id: str, user_id: str, content: str) -> Optional[str]:
-        """首轮对话后由 LLM 生成会话标题（后台任务，不阻塞响应）
-
-        失败时返回 None 并保留占位标题，不影响聊天主流程。
-        """
-        if self._title_generator is None:
-            return None
-
-        try:
-            title = await self._title_generator(content)
-        except Exception:
-            logger.exception("LLM 生成标题失败，保留占位标题: session_id=%s", session_id)
-            return None
-
-        title = (title or "").strip()
-        if not title:
-            return None
-
-        # 防御 LLM 输出过长标题，截断到列宽以内
-        title = title[:200]
-        logger.info("标题生成完成: session_id=%s title=%s", session_id, title)
-        return title
-
-    # ==================== 前置校验（供流式路由复用） ====================
-
-    async def ensure_session_owned(self, session_id: str, user_id: str) -> None:
-        """校验会话存在且归属该用户
-
-        供 SSE 流式路由在返回 StreamingResponse **之前**调用——响应一旦开始
-        发送，HTTP 状态码已固定，越权与不存在就再无法正确表达。
-
-        Raises:
-            SessionNotFoundError: 会话不存在或已软删除
-            SessionAccessDeniedError: 会话属于其他用户
-        """
-        await self._session_service.get_session_for_user(session_id, user_id)
-
-    def resolve_agent(self, agent_key: str) -> Any:
-        """按 key 获取 Agent 实例（同步版，供路由在流式响应前做前置校验）
-
-        Raises:
-            AgentNotFoundError: agent_key 未注册
-        """
-        try:
-            return self._agent_getter(agent_key)
-        except KeyError as e:
-            raise AgentNotFoundError(str(e)) from e
-
-    # ==================== 流式 + 持久化（前端主链路） ====================
-
-    async def stream_chat_persist(
-        self,
-        agent: Any,
-        content: str,
-        session_id: str,
-        user_id: str,
-        on_complete: Any,
-    ) -> AsyncIterator[str]:
-        """流式聊天并在结束后持久化，yield SSE 格式字符串
-
-        与 stream_chat 的区别：本方法在推送完回复后执行三存储写入，
-        让前端既能看到打字机效果，刷新后又能从 MongoDB 读回历史。
-
-        关键时序：done 事件必须在持久化**完成之后**才发送。前端收到 done
-        通常会立刻刷新会话列表/历史，若落库尚未完成就会读到旧数据，出现
-        "刚发的消息不见了"的竞态。done 事件携带 persisted 与 message_count，
-        供前端直接更新本地状态，省去一次列表请求。
-
-        客户端中途断连时不持久化半截回复（用 completed 标志位控制），
-        避免落库一条没有结尾的助手消息。
-
-        Args:
-            on_complete: 异步回调，签名 (assistant_text, tool_calls) -> Optional[int]，
-                         返回最新 message_count。由路由层注入 persist_turn，
-                         使服务层不依赖 FastAPI 的 app 对象。
-        """
-        accumulated = ""
-        tool_calls: list[ToolCall] = []
-        completed = False
-
-        try:
-            stream_input = {"messages": [{"role": "user", "content": content}]}
-            stream_config = {
-                "configurable": {
-                    # thread_id 与 session_id 一致：新建会话即新建 thread
-                    "thread_id": session_id,
-                    "context": {"user_id": user_id},
-                }
-            }
-
-            logger.info(
-                "开始流式聊天(持久化): user_id=%s session_id=%s", user_id, session_id
-            )
-
-            async for chunk_type, chunk_data in agent.astream(
-                stream_input,
-                stream_config,
-                stream_mode=["messages", "updates"],
-            ):
-                # 模式A：模型回复增量（前端打字机效果）
-                if chunk_type == "messages":
-                    msg = chunk_data[0]
-                    piece = self._extract_text(self._get_field(msg, "content"))
-                    if piece:
-                        # 累积口径与前端 accumulated 完全一致，
-                        # 保证「屏幕上看到的」和「落库的」是同一份文本
-                        accumulated += piece
-                        yield _format_sse({"type": "content", "content": piece})
-
-                    # 工具调用：流式 chunk 可能分片，这里取最后一次非空的完整值
-                    calls = self._extract_tool_calls(self._get_field(msg, "tool_calls"))
-                    if calls:
-                        tool_calls = calls
-
-                # 模式B：节点状态更新（前端展示思考链）
-                elif chunk_type == "updates":
-                    node_name = list(chunk_data.keys())[0]
-                    if node_name not in ("__start__", "__end__"):
-                        node_output = chunk_data[node_name]
-                        yield _format_sse({
-                            "type": "node_update",
-                            "node": node_name,
-                            "data": str(node_output)[:200],
-                        })
-
-            completed = True
-
-        except Exception as e:
-            logger.exception("流式聊天异常: session_id=%s", session_id)
-            yield _format_sse({"type": "error", "message": str(e)})
-            return
-
-        if not completed:
-            # 理论上到不了这里：异常已 return，客户端断连会触发 CancelledError
-            # 直接冒泡（刻意不捕获，避免把取消当成功持久化半截回复）
-            return
-
-        # —— 流式推送完毕，执行三存储持久化 ——
-        message_count: Optional[int] = None
-        persisted = True
-        try:
-            message_count = await on_complete(accumulated, tool_calls)
-            persisted = message_count is not None
-        except Exception:
-            logger.exception("流式对话持久化失败: session_id=%s", session_id)
-            persisted = False
-
-        if not persisted:
-            logger.error(
-                "回复已推送但持久化失败，历史中可能缺失本轮: session_id=%s", session_id
-            )
-
-        yield _format_sse({
-            "type": "done",
-            "persisted": persisted,
-            "message_count": message_count,
-        })
+def _citation_from_url(url: str) -> Citation:
+    """从检索 URL 构造引用来源。title 用域名占位，前端展示为参考链接。"""
+    domain = url
+    for prefix in ("https://", "http://"):
+        if domain.startswith(prefix):
+            domain = domain[len(prefix):]
+            break
+    domain = domain.split("/")[0]
+    return Citation(title=domain, url=url, snippet="")
 
 
 def _format_sse(data: dict) -> str:
     """格式化为 SSE data 帧（ensure_ascii=False 保证中文原样传输）"""
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
-__all__ = ["AgentNotFoundError", "ChatService", "ChatTurnResult"]
+__all__ = [
+    "AgentNotFoundError",
+    "ChatService",
+    "ChatTurnResult",
+    "SessionEndedHTTPError",
+]

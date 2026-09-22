@@ -25,23 +25,23 @@ interface ChatAreaProps {
 const QUICK_PROMPTS = [
   {
     agentRole: 'researcher' as AgentRole,
-    title: '🔍 市场调研',
-    prompt: '帮我调研一下当前 AI Agent 领域的最新发展趋势',
+    title: '🔍 行业调研',
+    prompt: '帮我梳理一下 AI Agent 领域近半年的主要进展与代表性产品',
   },
   {
-    agentRole: 'coder' as AgentRole,
+    agentRole: 'developer' as AgentRole,
     title: '💻 代码实现',
-    prompt: '用 Python 写一个快速排序算法，并添加详细注释',
+    prompt: '用 Python 写一个快速排序算法，写完后实际运行验证并给出结果',
   },
   {
-    agentRole: 'reviewer' as AgentRole,
-    title: '✅ 代码审查',
-    prompt: '帮我审查这段代码的安全性和性能问题',
+    agentRole: 'writer' as AgentRole,
+    title: '✍️ 内容创作',
+    prompt: '帮我写一篇关于「小团队如何引入 AI 编程助手」的公众号文章，1200 字左右',
   },
   {
-    agentRole: 'researcher' as AgentRole,
-    title: '📊 竞品分析',
-    prompt: '分析一下主流大模型 API 的优缺点对比',
+    agentRole: 'analyst' as AgentRole,
+    title: '📊 数据分析',
+    prompt: '我有一份销售数据 CSV，帮我做清洗、算出月度趋势并画成折线图',
   },
 ];
 

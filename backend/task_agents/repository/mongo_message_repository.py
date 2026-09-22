@@ -168,8 +168,8 @@ class MongoMessageRepository:
     async def delete_document(self, session_id: str) -> bool:
         """物理删除会话文档
 
-        注意：MySQL 侧默认是软删除（status=deleted）。是否同步物理删除
-        MongoDB 文档由 Service 层按数据保留策略决定。
+        注意：本系统不做软删除，会话结束由 MySQL 的 status=2 表达。
+        这里由 Service 层的删除流程调用（delete_session），与元数据一并清理。
         """
         result = await self._collection.delete_one({"_id": session_id})
         deleted = result.deleted_count > 0

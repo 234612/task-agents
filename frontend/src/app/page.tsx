@@ -7,7 +7,7 @@ import { Sidebar } from '@/components/layout/Sidebar';
 import { useAgentChat } from '@/hooks/useAgentChat';
 import { useSessions } from '@/hooks/useSessions';
 import { CURRENT_USER_ID } from '@/lib/config';
-import { AGENT_KEY_MAP, type AgentRole } from '@/types';
+import { AGENT_KEY_MAP, roleOfAgentKey, type AgentRole } from '@/types';
 
 export default function Home() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -47,14 +47,17 @@ export default function Home() {
     setActiveSessionId(null);
   }, [clearMessages]);
 
-  /** 点击侧边栏会话：加载该会话的完整历史 */
+  /** 点击侧边栏会话：按该会话创建时的角色还原，再加载完整历史 */
   const handleSelectSession = useCallback(
     (id: string) => {
       if (id === activeSessionId) return;
+      const session = sessions.find((s) => s.id === id);
+      const role = roleOfAgentKey(session?.agentKey);
+      setCurrentAgentRole(role);
       setActiveSessionId(id);
-      void loadHistory(id, currentAgentRole);
+      void loadHistory(id, role);
     },
-    [activeSessionId, currentAgentRole, loadHistory]
+    [activeSessionId, sessions, loadHistory]
   );
 
   /**
@@ -87,9 +90,23 @@ export default function Home() {
     [activeSessionId, createNewSession, sendMessage]
   );
 
-  const handleAgentChange = useCallback((role: AgentRole) => {
-    setCurrentAgentRole(role);
-  }, []);
+  /**
+   * 切换 Agent 角色 = 开启新会话
+   *
+   * session_id 同时是 LangGraph 的 thread_id，而 thread 里存的是某个引擎的
+   * 中间状态。让另一个引擎接着用同一个 thread_id，会读到结构不符的 state。
+   * 因此切换角色时清空当前会话视图，下一条消息会用新角色的 agent_key
+   * 懒创建一个新 session（与「新建对话」一致，不会凭空留下空会话）。
+   */
+  const handleAgentChange = useCallback(
+    (role: AgentRole) => {
+      if (role === currentAgentRole) return;
+      setCurrentAgentRole(role);
+      setActiveSessionId(null);
+      clearMessages();
+    },
+    [currentAgentRole, clearMessages]
+  );
 
   const handleDeleteSession = useCallback(
     async (id: string) => {
@@ -121,8 +138,10 @@ export default function Home() {
     if (sessions.length === 0) return;
 
     const first = sessions[0];
+    const role = roleOfAgentKey(first.agentKey);
+    setCurrentAgentRole(role);
     setActiveSessionId(first.id);
-    void loadHistory(first.id, currentAgentRole);
+    void loadHistory(first.id, role);
     // 只在首次加载完成时运行一次
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoadingSessions, sessions]);

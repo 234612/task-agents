@@ -1,18 +1,20 @@
 # Task Agents — 多 Agent 协作对话系统
 
-基于 LangGraph + Next.js 构建的多 Agent 协作聊天平台，支持研究员、程序员、审查员三种专业角色，通过 SSE 流式传输实现实时对话体验。
+基于 LangGraph + Next.js 构建的多 Agent 协作聊天平台，支持调研、开发、写作、分析四种专业角色，每种角色背后是一个独立的主 Agent 引擎，通过 SSE 流式传输实现实时对话体验。
 
 ---
 
 ## 功能特性
 
-- **多角色 Agent**：内置研究员（🔍）、程序员（💻）、审查员（✅）三种专业角色，各司其职
+- **多角色 Agent**：内置调研（🔍）、开发（💻）、写作（✍️）、分析（📊）四种专业角色，各自绑定一个独立的主 Agent 引擎
 - **流式响应**：基于 Server-Sent Events (SSE) 的实时流式输出，逐字呈现回答
 - **Markdown 渲染**：助手回复支持完整的 Markdown 格式，包括代码高亮、表格、列表等
 - **会话管理**：侧边栏展示历史会话列表，支持新建对话和切换会话
 - **快捷提示**：首页提供预设场景卡片，一键快速开始对话
 - **Agent 切换**：输入区域可随时切换当前对话的 Agent 角色
 - **中断生成**：支持随时停止正在生成中的回答
+
+> 想验证各引擎的实际效果？见 [AGENT_TEST_CASES.md](./AGENT_TEST_CASES.md)（含 12 个用例 + 跨角色对照实验 + 评分卡）。
 
 ---
 
@@ -63,17 +65,16 @@ task-agents/
 │       │   ├── session.py          # /api/sessions*
 │       │   └── chat.py             # /api/chat、/api/chat/stream
 │       └── agent/
-│           ├── factory.py          # Agent 注册表
-│           └── market_researcher_engine/
-│               ├── agent.py        # 主 Agent 装配 + 子 Agent 注册
-│               ├── prompts.py      # 主 Agent 系统提示词与委派规则
-│               ├── subagents/
-│               │   ├── data_collector/prompt.md
-│               │   ├── analyst/prompt.md
-│               │   └── programmer/prompt.md
-│               └── tools/
-│                   ├── web_research.py   # 数据采集工具
-│                   └── coding_tools.py   # 程序员沙箱工具
+│           ├── factory.py          # Agent 注册表（四个引擎统一装配）
+│           ├── shared_tools.py     # 共享工具转发层（沙箱 / 网页抓取）
+│           ├── market_researcher_engine/   # 🔍 调研
+│           ├── code_engineer_engine/       # 💻 开发
+│           ├── content_writer_engine/      # ✍️ 写作
+│           └── data_analyst_engine/        # 📊 分析
+│               └── 每个引擎结构相同：
+│                   ├── agent.py        # 主 Agent 装配 + 子 Agent 注册
+│                   ├── prompts.py      # 主 Agent 系统提示词与委派规则
+│                   └── subagents/{name}/prompt.md
 │
 └── frontend/                       # 前端应用
     ├── package.json
@@ -162,21 +163,26 @@ npm run dev      # 启动开发服务器
 
 ## Agent 角色说明
 
-前端提供三种角色供用户选择，当前均映射到后端的同一个主 Agent（`market_researcher`），由主 Agent 依据任务性质委派给对应子 Agent：
+四种角色一一对应后端四个**独立的主 Agent 引擎**（各自有系统提示词与子 Agent 组合），切换角色即切换引擎：
 
-| 前端角色 | 名称 | 映射的 agent_key | 实际承接的子 Agent |
-|------|------|------|------|
-| `researcher` | 🔍 研究员 | `market_researcher` | `data_collector`（数据采集）/ `analyst`（商业分析） |
-| `coder` | 💻 程序员 | `market_researcher` | `programmer`（代码编写与运行验证） |
-| `reviewer` | ✅ 审查员 | `market_researcher` | 由主 Agent 视任务委派 |
+| 前端角色 | 名称 | agent_key | 子 Agent | 工具 |
+|------|------|------|------|------|
+| `researcher` | 🔍 调研 | `market_researcher` | data_collector / analyst / programmer | 网页抓取 + 沙箱 |
+| `developer` | 💻 开发 | `code_engineer` | architect / coder / tester | 沙箱 |
+| `writer` | ✍️ 写作 | `content_writer` | outliner / writer / editor | 无（纯语言任务） |
+| `analyst` | 📊 分析 | `data_analyst` | data_loader / statistician / visualizer | 沙箱（pandas / matplotlib） |
 
-映射关系定义在 `frontend/src/types/index.ts` 的 `AGENT_KEY_MAP`。新增后端 Agent 时改这张表即可，无需改动组件代码。
+映射关系定义在 `frontend/src/types/index.ts` 的 `AGENT_KEY_MAP`（及其反查表 `AGENT_ROLE_BY_KEY`）。新增引擎时改这张表即可，无需改动组件代码。
 
-### 子 Agent 能力
+> **旧会话兼容**：历史会话库里的 `agent_key` 仍是 `market_researcher`，由「调研」角色继承，因此老会话不会失配（打开时会按 `agent_key` 反查回正确角色）。
+> **切换角色 = 新会话**：`session_id` 同时是 LangGraph 的 `thread_id`，thread 里存的是某个引擎的中间状态，让另一个引擎复用会造成 state 串味，因此切换角色时前端会清空当前会话视图，下一条消息懒创建新会话。
 
-- **data_collector**：联网信息搜集、网页内容提取
-- **analyst**：SWOT / PESTEL 等框架的商业分析与报告撰写
-- **programmer**：受限沙箱内的文件读写与 Python 执行，产出**经过真实运行验证**的代码（详见下文安全边界）
+### 各引擎能力
+
+- **market_researcher**：网页正文抓取（⚠️ 当前**未接入搜索工具**，需由用户提供 URL）、SWOT / PESTEL 等商业分析
+- **code_engineer**：架构设计 → 编码 → 测试闭环，产出**经过真实运行验证**的代码
+- **content_writer**：大纲 → 正文 → 审校，产出可直接使用的成稿
+- **data_analyst**：数据清洗 → 统计建模 → 图表落盘，依赖 `pandas` / `matplotlib`（已写入 `pyproject.toml`）
 
 ---
 
@@ -259,7 +265,15 @@ data: {"type": "done", "persisted": true, "message_count": 4}
 
 > `description` 要写清"什么情况下调用"，这是主 Agent 决定委派的唯一依据。
 
-**新增主 Agent（独立引擎）：** 复制 `market_researcher_engine/` 的结构，在 `agent/factory.py` 的 `build_agents()` 中注册到 `_REGISTRY`，前端 `AGENT_KEY_MAP` 指向新 key 即可。
+**新增主 Agent（独立引擎）：**
+
+1. 复制任一 `*_engine/` 的结构：`agent.py`（装配子 Agent）+ `prompts.py`（主提示词与委派规则）+ `subagents/{name}/prompt.md`
+2. 需要沙箱或网页抓取时，从 `agent/shared_tools.py` 取 `SANDBOX_TOOLS` / `WEB_TOOLS`，**不要**直接 import 某个引擎内部的 tools
+3. 在 `agent/factory.py` 的 `build_agents()` 里加一行 `_REGISTRY["xxx"] = create_xxx(**common)`
+4. 前端 `AGENT_KEY_MAP` 与 `AGENT_ROLE_BY_KEY` 指向新 key
+
+> 所有引擎共用 `common` 里的 LLM / checkpointer / store，差异只在提示词与子 Agent 组合，
+> 因此新增引擎的成本主要是写提示词。
 
 ### 前端常用命令
 

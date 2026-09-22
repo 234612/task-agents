@@ -100,14 +100,16 @@ def get_session_service(
 def get_chat_service(request: Request, db: DbSession) -> ChatService:
     """装配聊天服务
 
-    agent_getter 直接复用 factory 的注册表查询；title_generator 从 app.state
-    取（在 lifespan 中构造，避免每次请求都新建 LLM 客户端）。
+    agent_getter 直接复用 factory 的注册表查询（未注册时抛 KeyError，
+    由 ChatService.resolve_agent 转成 AgentNotFoundError）。
     session_service 用于在写入前校验会话归属，防止越权写他人会话。
+
+    注：标题不再由 LLM 生成（改为首句前 50 字，见 core/titleutils.py），
+    因此这里不再注入 title_generator。
     """
     return ChatService(
         message_service=get_message_service(request, db),
         agent_getter=get_agent_by_key,
-        title_generator=request.app.state.title_generator,
         session_service=get_session_service(request, db),
     )
 

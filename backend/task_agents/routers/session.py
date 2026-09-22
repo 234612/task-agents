@@ -164,15 +164,15 @@ async def archive_session(
     return SessionResponse.model_validate(session.to_dict())
 
 
-@router.delete("/{session_id}", summary="删除会话（软删除）")
+@router.delete("/{session_id}", summary="删除会话")
 async def delete_session(
     session_id: str,
     service: SessionServiceDep,
     user_id: str = Query(min_length=1, max_length=64, description="用户 ID，用于归属校验"),
 ):
-    """软删除会话：MySQL 标记 status=deleted，Redis 上下文立即释放
+    """删除会话：MySQL 元数据、MongoDB 历史文档与 Redis 上下文一并清理
 
-    MongoDB 历史文档默认保留，便于审计与恢复。
+    本系统不做软删除（会话结束用 status=2 表达），删除即从列表消失。
     """
     try:
         await service.delete_session(session_id, user_id=user_id)

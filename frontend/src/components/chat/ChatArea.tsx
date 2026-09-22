@@ -1,11 +1,26 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import { AlertCircle, Bot, ChevronDown } from 'lucide-react';
+import { AlertCircle, Bot } from 'lucide-react';
 
-import { InputArea } from './InputArea';
+import { InputArea, type ContextUsage } from './InputArea';
 import { MessageBubble } from './MessageBubble';
-import { AGENTS, type AgentRole, type Message } from '@/types';
+import { type AgentRole, type Message } from '@/types';
+
+/**
+ * 上下文 / Token 使用量估算
+ *
+ * 后端当前未下发真实 token 用量（SSE done 事件只带 message_count），
+ * 此处按「累计字符数 / 2.5」做混合中英文的粗略估算，仅用于胶囊展示。
+ * 待后端在 done 事件中附带 usage 后，可直接替换为真实数值。
+ */
+function estimateContextUsage(messages: Message[]): ContextUsage {
+  const chars = messages.reduce((sum, m) => sum + (m.content?.length ?? 0), 0);
+  const used = Math.ceil(chars / 2.5);
+  const total = 1_000_000; // 1M token 上下文窗口（示例量级）
+  const percent = total > 0 ? Math.min(100, (used / total) * 100) : 0;
+  return { percent, used, total };
+}
 
 interface ChatAreaProps {
   messages: Message[];
@@ -57,7 +72,6 @@ export function ChatArea({
   onStop,
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const currentAgent = AGENTS.find((a) => a.role === currentAgentRole)!;
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -80,11 +94,6 @@ export function ChatArea({
               {activeSessionId}
             </span>
           )}
-        </div>
-        <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5">
-          <span className="text-sm">{currentAgent.avatar}</span>
-          <span className="text-sm font-medium text-slate-700">{currentAgent.name}</span>
-          <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
         </div>
       </header>
 
@@ -162,6 +171,7 @@ export function ChatArea({
         isLoading={isLoading}
         currentAgentRole={currentAgentRole}
         onAgentChange={onAgentChange}
+        contextUsage={estimateContextUsage(messages)}
       />
     </div>
   );

@@ -106,7 +106,27 @@ APP_DEBUG=false
 CORS_ORIGINS=*
 SESSION_PAGE_SIZE=20
 SESSION_PAGE_SIZE_MAX=100
+
+# ==================== 云沙箱（代码执行能力，必填） ====================
+DAYTONA_API_KEY=your-daytona-key
+DAYTONA_API_URL=https://app.daytona.io/api
+DAYTONA_TARGET=us
+
+# ==================== 防失控 / 防烧钱（可选，均有默认值） ====================
+AGENT_RECURSION_LIMIT=30            # 单请求最大步数
+TOOL_FAILURE_BREAK_THRESHOLD=3      # 同一工具+同一参数连续失败几次熔断
+CODER_EXEC_TIMEOUT_SECONDS=15       # 单次沙箱执行超时（秒）
+
+# ==================== 沙箱治理（可选，0 = 关闭/不限） ====================
+SANDBOX_MAX_CONCURRENT=0            # 全局同时存活沙箱上限
+SANDBOX_MAX_PER_USER=0              # 单用户持有上限
+SANDBOX_IDLE_TTL_SECONDS=0          # 空闲多久销毁；0=每轮请求结束即销毁
+SANDBOX_ACQUIRE_TIMEOUT_SECONDS=0   # 池满时最多排队多久
+SANDBOX_AUTO_STOP_MINUTES=0         # Daytona 远端兜底自动停止
 ```
+
+> 配置项以 `backend/.env.example` 为准
+> **注意**：`Settings` 是 `extra=forbid`，`.env` 里出现**未定义的键**（包括拼错的）会让启动直接失败并报 `ValidationError`。新增环境变量必须同时改 `.env`、`.env.example` 和 `core/config.py` 的字段。
 
 ### 2.3 启动后端服务
 
@@ -351,7 +371,23 @@ SHOW VARIABLES LIKE 'collation%';
 - docker-compose.yml 已配置 `utf8mb4`，正常情况下不会有字符集问题
 - 如果仍有问题，重建容器: `docker compose down -v && docker compose up -d`
 
-### 7. MySQL 计数与 MongoDB 消息数不一致
+### 7. 代码执行报错 / Agent 反复重试
+
+**现象**: 回答里反复出现"执行环境异常"，或一条请求跑很久才结束
+
+**排查步骤**:
+```bash
+# 看沙箱链路日志（[sandbox] 前缀）
+# 正常应能看到：新建沙箱 → 执行开始 → 执行完成（带 exit_code 与耗时）→ 销毁沙箱
+```
+
+**常见原因与处理**:
+- **未配置 `DAYTONA_API_KEY`** → 补上后重启；不配也会有明确报错，不会静默失败
+- **Daytona 额度/网络问题** → 熔断会在连续失败 3 次后终止整轮，避免无限重试烧 token
+- **单条请求步数耗尽**（`AGENT_RECURSION_LIMIT`）→ 日志出现 `GraphRecursionError`，说明模型在空转，可调大步数或检查提示词
+- **`.env` 键名写错**（如 `DAYTONA_KEY` 而非 `DAYTONA_API_KEY`）→ 启动直接 `ValidationError`，见 2.2 的注意事项
+
+### 8. MySQL 计数与 MongoDB 消息数不一致
 
 **现象**: 会话列表的 `message_count` 与加载出的历史消息条数对不上
 

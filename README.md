@@ -1,343 +1,246 @@
-# Task Agents — 多 Agent 协作对话系统
+# Task Agents
 
-基于 LangGraph + Next.js 构建的多 Agent 协作聊天平台，支持调研、开发、写作、分析四种专业角色，每种角色背后是一个独立的主 Agent 引擎，通过 SSE 流式传输实现实时对话体验。
+自部署的多 Agent 执行平台。内置调研、开发、写作、分析四个专业引擎，任务可被委派给子 Agent 逐步完成，代码在隔离的 Daytona 云沙箱中真实运行。对话支持流式响应、会话记忆与持久化。
+
+技术栈：LangGraph + deepagents + Daytona + FastAPI + Next.js。
+
+## 核心能力
+
+- **四个专业引擎**：调研 / 开发 / 写作 / 分析各自是一个独立的主 Agent，内部按工序委派给 3 个子 Agent（共 12 个）
+- **云沙箱执行**：代码在 Daytona 云沙箱中真实运行，每个会话独占一个实例；只执行 Python，shell 命令与 `pip install` 会被拒绝
+- **执行可审计**：每次执行都记录沙箱实例 ID、实际运行的代码、耗时与退出码
+- **失控防护**：单请求步数上限、同一工具连续失败熔断、单次执行超时，阈值均可配置
+- **双层记忆**：Redis 短期上下文窗口（滑动窗口 + TTL）+ MongoDB 长期记忆（跨会话沉淀）
+- **分层存储**：MySQL 会话元数据 / MongoDB 对话历史 / Redis 上下文，按数据特征分派
+- **流式响应与持久化**：SSE 逐字输出，`done` 事件在落库之后下发，刷新历史不会丢消息
+- **会话隔离**：`session_id` 即 LangGraph `thread_id`，图状态与沙箱实例都按会话隔离
+- **配置驱动**：模型、存储、沙箱、安全与成本阈值全部通过环境变量配置
 
 ---
 
-## 功能特性
+## 架构
 
-- **多角色 Agent**：内置调研（🔍）、开发（💻）、写作（✍️）、分析（📊）四种专业角色，各自绑定一个独立的主 Agent 引擎
-- **流式响应**：基于 Server-Sent Events (SSE) 的实时流式输出，逐字呈现回答
-- **Markdown 渲染**：助手回复支持完整的 Markdown 格式，包括代码高亮、表格、列表等
-- **会话管理**：侧边栏展示历史会话列表，支持新建对话和切换会话
-- **快捷提示**：首页提供预设场景卡片，一键快速开始对话
-- **Agent 切换**：输入区域可随时切换当前对话的 Agent 角色
-- **中断生成**：支持随时停止正在生成中的回答
+```mermaid
+graph TB
+    U[用户] --> F[Next.js 前端]
+    F -->|SSE 流式| R[FastAPI Router]
+    R --> S[ChatService 编排]
+    S --> A[主 Agent 引擎]
+    A -->|task 委派| SA[子 Agent × 3]
+    SA --> T[工具层]
+    T -->|execute| SB[Daytona 云沙箱]
+    T -->|抓取| WEB[网页正文]
+    S --> M[(MySQL 元数据)]
+    S --> MO[(MongoDB 历史 + 长期记忆)]
+    S --> RD[(Redis 短期上下文)]
+    A -.->|熔断中间件| CB[连续失败熔断]
+```
 
-> 想验证各引擎的实际效果？见 [AGENT_TEST_CASES.md](./AGENT_TEST_CASES.md)（含 12 个用例 + 跨角色对照实验 + 评分卡）。
+`router → service → repository` 严格单向调用，仓储之间互不调用，事务边界由服务层控制。
 
 ---
 
-## 技术栈
+## 四大引擎 · 12 个子 Agent
 
-| 层级 | 技术 | 说明 |
-|------|------|------|
-| **前端** | Next.js 14 + React 18 | App Router 架构，TypeScript 类型安全 |
-| **UI** | Tailwind CSS | 原子化 CSS，配合 lucide-react 图标库 |
-| **Markdown** | react-markdown + remark-gfm | 支持 GFM 扩展语法 |
-| **后端** | FastAPI | 高性能异步 Web 框架 |
-| **Agent 框架** | LangGraph + deepagents | 主 Agent 委派子 Agent 的多智能体编排 |
-| **存储** | MySQL + MongoDB + Redis | 分层存储：元数据 / 对话历史 / 会话上下文 |
-| **ORM & 驱动** | SQLAlchemy 2 (async) + motor + redis.asyncio | 全链路异步，避免阻塞事件循环 |
-| **包管理** | uv (后端) / npm (前端) | 快速依赖管理 |
+每个引擎是**独立的主 Agent**（自己的系统提示词、自己的子 Agent 组合），切换角色即切换引擎：
+
+| 角色 | agent_key | 子 Agent | 工具 | 典型产出 |
+|---|---|---|---|---|
+| 🔍 调研 | `market_researcher` | data_collector / analyst / programmer | 网页抓取 + 沙箱 | 竞品与行业分析、SWOT / PESTEL |
+| 💻 开发 | `code_engineer` | architect / coder / tester | 沙箱 | **经过真实运行验证**的代码 |
+| ✍️ 写作 | `content_writer` | outliner / writer / editor | — | 大纲 → 正文 → 审校成稿 |
+| 📊 分析 | `data_analyst` | data_loader / statistician / visualizer | 沙箱（pandas / matplotlib） | 清洗 → 建模 → 图表 |
+
+新增引擎的成本主要是写提示词：复制一个 `*_engine/`、在 `factory.py` 加一行、前端映射表加一项即可。
+
+---
+
+## 云沙箱执行
+
+`execute` 工具背后是 Daytona 云沙箱，代码在远端真实运行。一次执行的完整链路：
+
+```
+[sandbox] 新建沙箱: thread=8f173b52-... sandbox=98319c2f-bb74-4171-88e8-002aff950e9d language=python
+[sandbox] 执行开始: thread=8f173b52-... sandbox=98319c2f-... timeout=30s code_len=46
+                    code='print(sum(i*i for i in range(1, 100001)) % 10)'
+[sandbox] 执行完成: thread=8f173b52-... sandbox=98319c2f-... exit_code=0 耗时=2.60s output='0\n'
+[sandbox] 销毁沙箱: thread=8f173b52-... sandbox=98319c2f-...
+```
+
+**执行安全边界**（`agent/sandbox_backend.py`）：
+
+| 边界 | 做法 |
+|---|---|
+| **会话隔离** | 沙箱按 `session_id` 一对一路由，会话之间互不可见 |
+| **只执行 Python** | shell 命令（`ls` / `cat` / `curl` …）一律拒绝并给出可替代写法 |
+| **禁止装包** | `pip install` 明确拒绝，缺库时要求模型如实告知用户而非自行安装 |
+| **高危命令黑名单** | `rm -rf` / `mkfs` / `sudo` / `curl \| bash` 等前置拦截 |
+| **超时强制终止** | 单次执行带超时（默认 15s，可配），死循环不会挂住请求 |
+| **输出限长** | 工具输出按配置截断，防止海量输出撑爆上下文与 Token |
+| **凭据隔离** | 代码在远端沙箱运行，后端进程的 `.env` 与数据库口令不在该环境中 |
+
+> 早期版本的代码执行是本地进程级约束——被执行的代码拥有后端进程的权限。当前版本已改为在独立云沙箱中执行。
+
+**已知边界**：文件读写目前仍在本地工作区（与远端执行环境不互通），全部搬到沙箱内已列入 [ROADMAP](./ROADMAP.md)。
+
+---
+
+## 成本与失控治理
+
+模型遇到执行环境错误时，往往会换个写法反复重试，一条请求可能空转上百步。为此设置了三层闸门：
+
+| 闸门 | 配置项 | 作用 |
+|---|---|---|
+| **步数上限** | `AGENT_RECURSION_LIMIT`（默认 30） | 兜底截断，超限转 error 事件，不无限跑 |
+| **连续失败熔断** | `TOOL_FAILURE_BREAK_THRESHOLD`（默认 3） | 同一工具 + 同一参数连续失败 N 次，**在下一次模型调用之前**终止整轮，零额外 token |
+| **执行超时** | `CODER_EXEC_TIMEOUT_SECONDS`（默认 15） | 单次沙箱执行超时即终止 |
+| **沙箱治理** | `SANDBOX_MAX_CONCURRENT` / `SANDBOX_MAX_PER_USER` / `SANDBOX_IDLE_TTL_SECONDS` / `SANDBOX_ACQUIRE_TIMEOUT_SECONDS` / `SANDBOX_AUTO_STOP_MINUTES` | 并发上限、单用户配额、空闲回收、远端兜底停止（默认 0 = 关闭，保持现状） |
+
+熔断的触发位置是个细节：如果**在工具调用阶段**抛异常，会被框架捕获成一条错误消息重新喂给模型，模型会继续尝试；因此实现为**在下一次模型调用之前**终止整轮运行，此后不再产生新的 token。
+
+---
+
+## 双层记忆
+
+| 层 | 存储 | 机制 |
+|---|---|---|
+| **短期** | Redis | 最近 N 轮滑动窗口（`REDIS_CONTEXT_MAX_TURNS`），TTL 自动过期，为 Prompt 注入提供亚毫秒读取 |
+| **长期** | MongoDB (`MongoDBStore`) | 跨会话沉淀（如 `/memories/preferences.md`），由 Agent 自主读写 |
+| **图状态** | Redis / 内存 (`CHECKPOINT_BACKEND`) | LangGraph checkpointer，`auto` 模式自动探测 Redis 是否支持 RedisJSON |
+
+冷热分离带来的好处：会话冷启动只回灌最近几轮，长会话不会被历史拖垮上下文。
+
+---
+
+## 分层存储
+
+| 存储 | 承载 | 选型理由 |
+|---|---|---|
+| **MySQL** | 会话元数据 | 列表页要排序 / 分页 / 筛选，`(user_id, updated_at)` 联合索引消除 filesort |
+| **MongoDB** | 对话历史（内嵌 `messages`）+ 长期记忆 | 文档模型一次取回整条会话，免 JOIN；`$push` 契合高频追加写 |
+| **Redis** | 短期上下文 + 图状态 | 亚毫秒读写 + TTL 自动过期 |
+
+需要接受的取舍：MySQL 计数与 MongoDB 实际条数是**最终一致**，可用 `MessageWriteService.compare_counts()` 对账。
+
+---
+
+## 流式与持久化
+
+SSE 事件类型：`meta` / `content` / `tool_call` / `tool_result` / `thinking` / `done` / `error`。
+
+`done` 事件**刻意安排在落库之后**下发——前端收到它时刷新历史一定能读到本轮消息，不存在竞态。无论正常完成、异常还是客户端断连，沙箱都会在 `finally` 中回收，不漏资源。
+
+---
+
+## 快速开始
+
+详细启动步骤与排障见 [backend/startup.md](backend/startup.md)。
+
+### 环境要求
+
+- **Node.js** >= 18
+- **Python** >= 3.14 + **uv**
+- **Docker Desktop**（MySQL / MongoDB / Redis）
+- **Daytona 账号与 API Key**（云沙箱，[app.daytona.io](https://app.daytona.io) 申请）
+
+### 1. 启动存储
+
+```bash
+cd backend
+docker compose up -d      # MySQL(3306) + MongoDB(27017) + Redis(6379)
+```
+
+### 2. 配置后端
+
+```bash
+cd backend
+cp .env.example .env
+```
+
+必填项：
+
+```ini
+LLM_API_KEY=...            # 大模型（OpenAI 兼容接口）
+DAYTONA_API_KEY=...        # 云沙箱，代码执行能力依赖它
+DAYTONA_API_URL=https://app.daytona.io/api
+DAYTONA_TARGET=us
+```
+
+### 3. 启动
+
+```bash
+uv sync
+uv run uvicorn task_agents.main:app --reload --port 8000   # 后端 :8000，文档 /docs
+
+cd frontend && npm install && npm run dev                  # 前端 :3000
+```
+
+可选：写入演示数据，直接看到侧边栏与历史效果。
+
+```bash
+uv run python scripts/seed_demo_data.py
+```
+
+> **关于执行环境**：不配 `DAYTONA_API_KEY` 也能启动，但代码执行会返回"执行环境不可用"（熔断不会让它反复重试）。想体验完整能力请配置。
+> **用户登录**：尚未实现，`user_id` 由 `frontend/src/lib/config.ts` 的 `CURRENT_USER_ID` 提供（当前 `userid_1`）。**当前无鉴权，请勿直接暴露公网。**
 
 ---
 
 ## 项目结构
 
 ```
-task-agents/
-├── backend/                        # 后端服务
-│   ├── pyproject.toml              # Python 项目配置 (uv)
-│   ├── uv.lock                     # 依赖锁文件
-│   ├── docker-compose.yml          # MySQL / MongoDB / Redis
-│   ├── startup.md                  # 详细启动文档与排障指南
-│   ├── scripts/
-│   │   └── seed_demo_data.py       # 演示数据种子脚本（幂等）
-│   ├── workspace/                  # programmer 子 Agent 的代码工作区（不入库）
-│   └── task_agents/
-│       ├── main.py                 # 应用入口：lifespan 初始化三存储 + 路由注册
-│       ├── core/
-│       │   ├── config.py           # 配置（LLM / 三存储 / 分页 / 编程沙箱）
-│       │   └── timeutils.py        # UTC 时间工具
-│       ├── database/
-│       │   ├── models.py           # SQLAlchemy: chat_sessions 表 + 联合索引
-│       │   ├── engine.py           # MySQL 引擎与会话工厂
-│       │   ├── mongo.py            # MongoDB 客户端（motor）
-│       │   ├── redis.py            # Redis 客户端
-│       │   └── redis_keys.py       # Redis Key 命名规范
-│       ├── schemas/
-│       │   ├── api.py              # HTTP 请求/响应模型
-│       │   └── mongo.py            # MongoDB 文档模型
-│       ├── repository/             # 仓储层：一个存储引擎一个类
-│       ├── service/                # 服务层：跨引擎业务编排
-│       ├── routers/
-│       │   ├── session.py          # /api/sessions*
-│       │   └── chat.py             # /api/chat、/api/chat/stream
-│       └── agent/
-│           ├── factory.py          # Agent 注册表（四个引擎统一装配）
-│           ├── shared_tools.py     # 共享工具转发层（沙箱 / 网页抓取）
-│           ├── market_researcher_engine/   # 🔍 调研
-│           ├── code_engineer_engine/       # 💻 开发
-│           ├── content_writer_engine/      # ✍️ 写作
-│           └── data_analyst_engine/        # 📊 分析
-│               └── 每个引擎结构相同：
-│                   ├── agent.py        # 主 Agent 装配 + 子 Agent 注册
-│                   ├── prompts.py      # 主 Agent 系统提示词与委派规则
-│                   └── subagents/{name}/prompt.md
-│
-└── frontend/                       # 前端应用
-    ├── package.json
-    ├── tsconfig.json
-    └── src/
-        ├── app/
-        │   └── page.tsx            # 主页面（懒创建会话、会话切换编排）
-        ├── components/
-        │   ├── layout/
-        │   │   └── Sidebar.tsx     # 侧边栏（列表、骨架屏、空状态、删除）
-        │   └── chat/
-        │       ├── ChatArea.tsx      # 聊天主区域（加载态、错误提示、欢迎页）
-        │       ├── MessageBubble.tsx # 消息气泡（Markdown、工具调用、流式态）
-        │       └── InputArea.tsx     # 输入区域（Agent 选择、发送控制）
-        ├── hooks/
-        │   ├── useSessions.ts      # 会话列表（拉取/新建/删除/本地更新）
-        │   └── useAgentChat.ts     # 消息（SSE 流式接收、历史加载、并发防护）
-        ├── types/
-        │   └── index.ts            # 类型定义 + AGENT_KEY_MAP
-        └── lib/
-            ├── config.ts           # user_id 与后端地址（唯一 hardcode 处）
-            ├── api.ts              # 接口封装：DTO 适配 + SSE 流解析
-            └── utils.ts            # cn 类名合并
+backend/task_agents/
+├── core/          配置（LLM / 三存储 / 成本闸门 / 沙箱治理）
+├── database/      MySQL 引擎 + MongoDB / Redis 客户端 + Key 规范
+├── repository/    仓储层（一个存储引擎一个类）
+├── service/       服务层（ChatService 编排、沙箱池、熔断重置）
+├── routers/       session / chat（含 SSE）
+├── sandbox/
+│   ├── sandbox_manager.py    沙箱机制层：创建 / 复用 / 销毁（同步原语）
+│   └── sandbox_registry.py   沙箱策略层：异步适配、失败降级、生命周期
+└── agent/
+    ├── factory.py            四引擎统一装配
+    ├── middleware/           loop_breaker（连续失败熔断）
+    ├── sandbox_backend.py    受限执行 backend（只跑 Python + 安全边界）
+    └── *_engine/             四个主引擎（agent.py + prompts.py + subagents/）
 ```
 
-后端调用方向严格单向：`router → service → repository`，仓储之间互不调用，事务边界由服务层控制。前后端字段差异统一在 `frontend/src/lib/api.ts` 消化，组件层只认前端视图模型。
+> 沙箱分层是有意的：`sandbox_manager` 全同步（贴着 SDK），`sandbox_registry` 全 async（用 `asyncio.to_thread` 把阻塞调用挪出事件循环）。边界清晰后，"忘了套 to_thread 导致整条事件循环卡死"这类 bug 无处藏身。
 
 ---
 
-## 快速开始
-
-详细的启动步骤、排障指南与 API 说明见 [backend/startup.md](backend/startup.md)。
-
-### 环境要求
-
-- **Node.js** >= 18
-- **Python** >= 3.14（见 `backend/pyproject.toml` 的 `requires-python`）
-- **uv**（Python 包管理器）
-- **Docker Desktop**（运行 MySQL / MongoDB / Redis）
-
-### 1. 克隆项目
-
-```bash
-git clone <your-repo-url>
-cd task-agents
-```
-
-### 2. 启动数据存储
-
-```bash
-cd backend
-docker compose up -d          # MySQL(3306) + MongoDB(27017) + Redis(6379)
-docker compose ps             # 确认三个容器均为 running
-```
-
-### 3. 启动后端
-
-```bash
-cd backend
-cp .env.example .env          # 然后填入真实的 LLM_API_KEY
-uv sync                       # 安装依赖
-uv run uvicorn task_agents.main:app --reload --port 8000
-```
-
-后端默认运行在 `http://localhost:8000`，接口文档见 `http://localhost:8000/docs`。
-
-启动时可写入演示数据，便于直接看到侧边栏与对话历史效果：
-
-```bash
-uv run python scripts/seed_demo_data.py
-```
-
-### 4. 启动前端
-
-```bash
-cd frontend
-npm install      # 安装依赖
-npm run dev      # 启动开发服务器
-```
-
-前端默认运行在 `http://localhost:3000`。
-
-> 用户登录尚未实现，`user_id` 由 `frontend/src/lib/config.ts` 中的 `CURRENT_USER_ID` 提供（当前为 `userid_1`，与种子脚本一致）。
-
----
-
-## Agent 角色说明
-
-四种角色一一对应后端四个**独立的主 Agent 引擎**（各自有系统提示词与子 Agent 组合），切换角色即切换引擎：
-
-| 前端角色 | 名称 | agent_key | 子 Agent | 工具 |
-|------|------|------|------|------|
-| `researcher` | 🔍 调研 | `market_researcher` | data_collector / analyst / programmer | 网页抓取 + 沙箱 |
-| `developer` | 💻 开发 | `code_engineer` | architect / coder / tester | 沙箱 |
-| `writer` | ✍️ 写作 | `content_writer` | outliner / writer / editor | 无（纯语言任务） |
-| `analyst` | 📊 分析 | `data_analyst` | data_loader / statistician / visualizer | 沙箱（pandas / matplotlib） |
-
-映射关系定义在 `frontend/src/types/index.ts` 的 `AGENT_KEY_MAP`（及其反查表 `AGENT_ROLE_BY_KEY`）。新增引擎时改这张表即可，无需改动组件代码。
-
-> **旧会话兼容**：历史会话库里的 `agent_key` 仍是 `market_researcher`，由「调研」角色继承，因此老会话不会失配（打开时会按 `agent_key` 反查回正确角色）。
-> **切换角色 = 新会话**：`session_id` 同时是 LangGraph 的 `thread_id`，thread 里存的是某个引擎的中间状态，让另一个引擎复用会造成 state 串味，因此切换角色时前端会清空当前会话视图，下一条消息懒创建新会话。
-
-### 各引擎能力
-
-- **market_researcher**：网页正文抓取（⚠️ 当前**未接入搜索工具**，需由用户提供 URL）、SWOT / PESTEL 等商业分析
-- **code_engineer**：架构设计 → 编码 → 测试闭环，产出**经过真实运行验证**的代码
-- **content_writer**：大纲 → 正文 → 审校，产出可直接使用的成稿
-- **data_analyst**：数据清洗 → 统计建模 → 图表落盘，依赖 `pandas` / `matplotlib`（已写入 `pyproject.toml`）
-
----
-
-## API 接口
-
-完整接口清单与分层存储设计见 [backend/startup.md](backend/startup.md)。核心接口：
+## API
 
 | 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/sessions` | 分页查询会话列表，按最后活跃时间倒序 |
+|---|---|---|
+| GET | `/api/sessions` | 分页查询会话列表（按最后活跃倒序） |
 | POST | `/api/sessions` | 创建会话（`session_id` 即 Agent 的 `thread_id`） |
-| GET | `/api/sessions/{session_id}/messages` | 加载会话历史消息 |
-| POST | `/api/chat/stream` | **前端主链路**：SSE 流式推送 + 三存储持久化 |
-| POST | `/api/chat` | 发送消息，一次性返回完整回复 |
+| GET | `/api/sessions/{session_id}/messages` | 加载历史消息 |
+| POST | `/api/chat/stream` | **主链路**：SSE 流式推送 + 三存储持久化 |
+| POST | `/api/chat` | 一次性返回完整回复 |
 
-### POST `/api/chat/stream`
-
-**请求体：**
-
-```json
-{
-  "session_id": "demo-sess-0001-arch-storage",
-  "user_id": "userid_1",
-  "agent_key": "market_researcher",
-  "content": "帮我写一个快速排序算法"
-}
-```
-
-**响应格式：** `text/event-stream`
-
-```
-data: {"type": "node_update", "node": "programmer", "data": "..."}
-data: {"type": "content", "content": "好的"}
-data: {"type": "content", "content": "，下面是实现"}
-data: {"type": "done", "persisted": true, "message_count": 4}
-```
-
-`done` 事件在**持久化完成之后**才下发，因此前端收到它时刷新历史一定能读到本轮消息，不存在竞态。
-
-> 会话归属校验在响应开始前完成：越权返回 403，会话不存在返回 404。SSE 一旦开始发送，状态码已固定为 200，此后无法再表达权限错误。
+完整接口与分层存储设计见 [backend/startup.md](backend/startup.md)。
 
 ---
 
-## 核心流程
+## 技术栈
 
-```
-用户输入 → 选择 Agent 角色
-              ↓
-   （无活跃会话时先 POST /api/sessions 创建，拿到 session_id）
-              ↓
-   POST /api/chat/stream  (SSE)
-              ↓
-   后端主 Agent 按任务委派子 Agent（数据采集 / 分析 / 编程）
-              ↓
-   流式推送 content 帧 → 前端逐字渲染 Markdown
-              ↓
-   推送完毕 → 写 Redis（上下文）+ MySQL（计数/活跃时间）+ MongoDB（历史）
-              ↓
-   下发 done 事件 → 前端把该会话移到侧边栏首位
-```
+| 层级 | 技术 |
+|---|---|
+| 前端 | Next.js 14 + React 18 + TypeScript + Tailwind CSS |
+| 后端 | FastAPI（全链路 async） |
+| Agent 框架 | LangGraph + deepagents |
+| 代码执行 | **Daytona 云沙箱** |
+| 存储 | MySQL 8 + MongoDB 7 + Redis（SQLAlchemy 2 async / motor / redis.asyncio） |
+| 包管理 | uv / npm |
 
 ---
 
-## 开发指南
+## 路线图
 
-### 添加新 Agent 角色
+全链路观测、任务状态持久化与中断恢复、Kafka 任务入口与业务钩子、执行步骤可视化、token 用量面板、沙箱并发治理等，见 [ROADMAP.md](./ROADMAP.md)。
 
-**前端侧：**
-
-1. 在 `frontend/src/types/index.ts` 的 `AgentRole` 联合类型中添加新角色
-2. 在同文件的 `AGENTS` 数组中定义角色的名称、头像和描述
-3. 在同文件的 `AGENT_KEY_MAP` 中把新角色映射到后端 `agent_key`
-
-**后端侧（若需要新的子 Agent）：**
-
-4. 在 `agent/market_researcher_engine/subagents/{name}/prompt.md` 写子 Agent 提示词（结构参照现有：`# Role` / `# Workflow` / `# Output Format` / `# Constraints`）
-5. 如需专属工具，在 `tools/` 下新建模块并导出工具列表（用 `@tool` 装饰器定义）
-6. 在 `agent/market_researcher_engine/agent.py` 的 `subagents` 列表中注册，填 `name` / `description` / `system_prompt` / `tools`
-7. 在 `prompts.py` 的主提示词中补充该子 Agent 的委派规则，否则主 Agent 不知何时该用它
-
-> `description` 要写清"什么情况下调用"，这是主 Agent 决定委派的唯一依据。
-
-**新增主 Agent（独立引擎）：**
-
-1. 复制任一 `*_engine/` 的结构：`agent.py`（装配子 Agent）+ `prompts.py`（主提示词与委派规则）+ `subagents/{name}/prompt.md`
-2. 需要沙箱或网页抓取时，从 `agent/shared_tools.py` 取 `SANDBOX_TOOLS` / `WEB_TOOLS`，**不要**直接 import 某个引擎内部的 tools
-3. 在 `agent/factory.py` 的 `build_agents()` 里加一行 `_REGISTRY["xxx"] = create_xxx(**common)`
-4. 前端 `AGENT_KEY_MAP` 与 `AGENT_ROLE_BY_KEY` 指向新 key
-
-> 所有引擎共用 `common` 里的 LLM / checkpointer / store，差异只在提示词与子 Agent 组合，
-> 因此新增引擎的成本主要是写提示词。
-
-### 前端常用命令
-
-```bash
-npm run dev      # 开发模式
-npm run build    # 生产构建
-npm run start    # 启动生产服务
-npm run lint     # ESLint 检查
-```
-
-### 后端依赖管理
-
-```bash
-uv add <package>    # 添加依赖
-uv remove <package> # 移除依赖
-uv sync             # 同步依赖
-```
-
----
-
-## 分层存储架构
-
-不同数据特征匹配不同存储引擎，避免用单一数据库硬扛所有场景：
-
-| 存储 | 承载内容 | 选型理由 |
-|------|---------|---------|
-| **MySQL** | 会话元数据（`chat_sessions` 表） | 列表页要排序、分页、筛选，ACID 与二级索引正好适配。`(user_id, updated_at)` 联合索引消除 filesort |
-| **MongoDB** | 对话历史（内嵌 `messages` 数组） | 文档模型一次查询取回整条会话，免 JOIN；`$push` 追加写契合高频写入 |
-| **Redis** | 会话短期记忆（最近 N 轮） | 亚毫秒读写 + TTL 自动过期，为 Prompt 注入提供低延迟上下文 |
-
-写入路径：**同步**写 Redis（上下文即时生效）+ **同步**写 MySQL（`updated_at`、`message_count`，保证侧边栏排序即时正确）+ 写 MongoDB（历史详情）。
-
-需要接受的取舍：MySQL 计数与 MongoDB 实际条数是**最终一致**而非强一致。若 MongoDB 写入失败会出现偏差，可用 `MessageWriteService.compare_counts()` 对账，以 MongoDB 实际条数为准回写。
-
----
-
-## 程序员子 Agent 的安全边界
-
-`programmer` 能读写文件并执行 LLM 生成的代码，因此**把模型输出当作不可信输入**来设防（实现在 `tools/coding_tools.py`）：
-
-| 边界 | 做法 |
-|------|------|
-| **路径隔离** | 所有文件操作限制在工作区内。先 `resolve()` 消除 `..` 与符号链接，再校验前缀——顺序不能反，否则 `workspace/../secret` 会绕过字符串前缀判断 |
-| **子进程执行** | 代码在独立进程运行并带超时强制终止，死循环不会挂住主服务 |
-| **凭据隔离** | 子进程只继承环境变量白名单（`PATH`、`TEMP` 等），`LLM_API_KEY`、数据库口令一律不透传 |
-| **输出限长** | 所有工具返回按配置截断，防止海量输出撑爆上下文与 Token |
-| **类型与体积限制** | 仅允许文本类扩展名读写；单文件有大小上限 |
-
-配置项（见 `.env.example`）：`CODER_WORKSPACE_DIR`、`CODER_EXEC_TIMEOUT_SECONDS`、`CODER_MAX_OUTPUT_CHARS`、`CODER_MAX_FILE_BYTES`。
-
-**已知局限（务必留意）**：这是**进程级约束，不是容器级沙箱**。被执行的代码仍拥有运行后端的那个操作系统用户的权限，能发起网络请求、读取工作区外的文件。若要用于不可信的多租户生产环境，必须再套一层容器 / gVisor 隔离。
-
-以上边界均有实测覆盖：4 类路径穿越拦截、凭据不可见、死循环超时终止、超长输出截断。
-
----
-
-## 技术亮点
-
-- **前后端完全分离**：前端 Next.js 负责 UI 交互，后端 FastAPI 负责 Agent 编排，职责清晰
-- **分层存储**：按数据特征分配存储引擎，而非用单一数据库硬扛排序、追加写与低延迟上下文三种截然不同的负载
-- **SSE 流式 + 持久化**：`done` 事件刻意安排在落库之后下发，消除"前端刷新历史时读不到刚发消息"的竞态
-- **多 Agent 委派**：主 Agent 按任务性质分派给数据采集 / 分析 / 编程子 Agent，各司其职
-- **类型安全**：前端全链路 TypeScript 类型覆盖；后端 Pydantic 定义 HTTP 契约，与内部领域模型解耦
-- **并发防护**：`useAgentChat` 用递增令牌使过期回调失效，避免"在 A 会话流式输出途中切到 B，A 的增量写进了 B 的列表"
+想验证各引擎实际效果，见 [AGENT_TEST_CASES.md](./AGENT_TEST_CASES.md)（12 个用例 + 跨角色对照 + 评分卡）。
 
 ---
 

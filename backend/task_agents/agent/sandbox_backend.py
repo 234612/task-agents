@@ -29,19 +29,21 @@ from __future__ import annotations
 import ast
 import logging
 import re
-import subprocess
-import sys
+import time
 from pathlib import Path
+from typing import Callable, cast
 
 from deepagents.backends.filesystem import FilesystemBackend
-from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
+from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol, FileDownloadResponse
+from deepagents.backends.sandbox import BaseSandbox
+from langgraph.config import get_config
 
 from task_agents.agent.market_researcher_engine.tools.coding_tools import (
-    _safe_env,
-    _truncate,
     _workspace_root,
 )
 from task_agents.core.config import get_settings
+from task_agents.core.services import service_container as container
+from task_agents.sandbox.sandbox_manager import SandboxManager
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,14 @@ _REJECT_HINT = (
     "你收到的命令是: {cmd!r}"
 )
 
+# 高危命令黑名单（正则）
+DANGEROUS_PATTERNS = [
+    r'rm\s+(-rf?|--no-preserve-root)',
+    r'mkfs', r'dd\s+if=', r'>\s*/dev/sd',
+    r'curl.*\|\s*bash', r'wget.*\|\s*sh',
+    r'chmod\s+777', r'sudo', r'su\s',
+]
+
 
 def _strip_quotes(text: str) -> str:
     """去掉包裹在外层的一对引号"""
@@ -68,24 +78,14 @@ def _strip_quotes(text: str) -> str:
     return text
 
 
-class RestrictedSandboxBackend(FilesystemBackend, SandboxBackendProtocol):
+class RestrictedSandboxBackend(SandboxBackendProtocol):
     """工作区内的真实文件系统 + 仅 Python 的受限执行"""
 
-    def __init__(
-        self,
-        root_dir: str | Path | None = None,
-        *,
-        timeout: int | None = None,
-    ) -> None:
-        settings = get_settings()
-        super().__init__(
-            root_dir=root_dir or settings.coder_workspace_dir,
-            virtual_mode=True,  # 关键：把 root_dir 当虚拟根，封锁 .. 逃逸
-            max_file_size_mb=10,
-        )
-        self._timeout = timeout or settings.CODER_EXEC_TIMEOUT_SECONDS
-        # 目录不存在时补建，避免 Agent 第一次写文件就失败
-        Path(self.cwd).mkdir(parents=True, exist_ok=True)
+    def __init__(self, manager: SandboxManager,
+                 timeout: int | None = None):
+        super().__init__()
+        self.manager = manager
+        self.default_timeout = timeout or 30
 
     @property
     def id(self) -> str:
@@ -130,7 +130,7 @@ class RestrictedSandboxBackend(FilesystemBackend, SandboxBackendProtocol):
             return None, _REJECT_HINT.format(cmd=cmd)
 
         # 语法预检：不是合法 Python 就别丢给解释器，否则模型看到的是
-        #SyntaxError traceback，会误以为"环境坏了"而反复重试。
+        # SyntaxError traceback，会误以为"环境坏了"而反复重试。
         try:
             ast.parse(cmd)
         except SyntaxError as e:
@@ -184,54 +184,143 @@ class RestrictedSandboxBackend(FilesystemBackend, SandboxBackendProtocol):
     # ==================== 执行 ====================
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        """在受限环境中执行 Python（拒绝一切 shell 命令）"""
-        code, error = self._to_python_code(command)
-        if error:
-            logger.info("沙箱拒绝执行: %s", error.splitlines()[0])
-            return ExecuteResponse(output=error, exit_code=1, truncated=False)
+        started = time.monotonic()
+        thread_id = self._current_thread_id()
+        sandbox_id = getattr(self._try_get_sandbox(), "id", "?")
 
-        effective_timeout = timeout or self._timeout
+
+        for pattern in DANGEROUS_PATTERNS:
+            if re.search(pattern, command, re.IGNORECASE):
+                logger.warning(
+                    "[sandbox] 高危命令拦截: thread=%s sandbox=%s pattern=%s cmd=%.120r",
+                    thread_id, sandbox_id, pattern, command,
+                )
+                return ExecuteResponse(
+                    output=f"安全拦截: 命令包含高危模式 '{pattern}'",
+                    exit_code=1, truncated=False
+                )
+
         try:
-            completed = subprocess.run(
-                [sys.executable, "-I", "-c", code],
-                cwd=str(self.cwd),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=effective_timeout,
-                env=_safe_env(),
-                stdin=subprocess.DEVNULL,
+            sandbox = self._get_sandbox()
+        except ValueError as e:
+            logger.error("[sandbox] 路由失败(无 thread_id): thread=%s err=%s", thread_id, e)
+            return ExecuteResponse(
+                output=f"沙箱路由失败: {str(e)}",
+                exit_code=1, truncated=False
             )
-        except subprocess.TimeoutExpired as e:
-            partial = (e.stdout or "") if isinstance(e.stdout, str) else ""
+
+        code, err = self._to_python_code(command)
+        if err:
+            logger.info(
+                "[sandbox] 拒绝非 Python 输入: thread=%s sandbox=%s cmd=%.120r",
+                thread_id, sandbox_id, command,
+            )
+            return ExecuteResponse(output=err, exit_code=1, truncated=False)
+
+        effective_timeout = timeout or self.default_timeout
+        logger.info(
+            "[sandbox] 执行开始: thread=%s sandbox=%s timeout=%ss code_len=%d code=%.200r",
+            thread_id, sandbox.id, effective_timeout, len(code), code,
+        )
+        try:
+            result = sandbox.process.code_run(code, timeout=effective_timeout)
+            stdout = getattr(result, "result", None)
+            if not stdout:
+                stdout = getattr(getattr(result, "artifacts", None), "stdout", "") or ""
+            if not stdout:
+                stdout = "（执行完毕但没有任何输出，请用 print() 打印你要看的结果）"
+
+            logger.info(
+                "[sandbox] 执行完成: thread=%s sandbox=%s exit_code=%s 耗时=%.2fs output_len=%d output=%.200r",
+                thread_id, sandbox.id, result.exit_code,
+                time.monotonic() - started, len(stdout), stdout,
+            )
+            return ExecuteResponse(
+                output=stdout,
+                exit_code=result.exit_code,
+                truncated=False
+            )
+        except TimeoutError:
+            logger.warning(
+                "[sandbox] 执行超时: thread=%s sandbox=%s timeout=%ss 耗时=%.2fs",
+                thread_id, sandbox.id, effective_timeout, time.monotonic() - started,
+            )
+            return ExecuteResponse(
+                output=f"命令执行超时（{effective_timeout}s），已强制终止",
+                exit_code=124, truncated=False
+            )
+        except Exception as e:
+            logger.exception(
+                "[sandbox] 执行环境异常: thread=%s sandbox=%s 耗时=%.2fs code=%.200r",
+                thread_id, sandbox_id, time.monotonic() - started, code,
+            )
             return ExecuteResponse(
                 output=(
-                    f"错误: 执行超时（超过 {effective_timeout} 秒），已终止。\n"
-                    f"检查是否存在死循环、无限递归或等待输入。\n"
-                    f"超时前输出:\n{_truncate(partial)}"
+                    f"执行环境异常: {type(e).__name__}: {e}\n"
+                    "这不是你的代码问题，重复调用也不会成功。\n"
+                    "请停止重试，如实告诉用户「代码执行环境当前不可用」，"
+                    "并把你本来要执行的代码作为文本提供给用户参考。"
                 ),
-                exit_code=124,
-                truncated=False,
-            )
-        except OSError as e:
-            return ExecuteResponse(
-                output=f"错误: 无法启动 Python 解释器 - {e}",
-                exit_code=1,
-                truncated=False,
+                exit_code=1, truncated=False
             )
 
-        stdout = _truncate(completed.stdout or "")
-        stderr = _truncate(completed.stderr or "")
-        parts = [f"退出码: {completed.returncode}", f"--- stdout ---\n{stdout or '(空)'}"]
-        if stderr:
-            parts.append(f"--- stderr ---\n{stderr}")
-        if completed.returncode != 0:
-            parts.append("提示: 非零退出码表示执行失败，请依据 stderr 修正代码后重试。")
+    def _get_sandbox(self) -> BaseSandbox:
+        """
+        从当前运行时上下文提取 thread_id 并获取沙箱。
+        适用于 execute 等无 runtime 参数的场景。
+        """
+        config = get_config()
+        thread_id = config.get("configurable", {}).get("thread_id")
+        if not thread_id:
+            raise ValueError("运行时上下文缺少 thread_id，无法路由沙箱")
+        return self.manager.get_or_create_sandbox(thread_id=cast(str, thread_id))
 
-        output = "\n\n".join(parts)
-        truncated = len(output) > get_settings().CODER_MAX_OUTPUT_CHARS
-        return ExecuteResponse(output=output, exit_code=completed.returncode, truncated=truncated)
+    # ==================== 观测辅助 ====================
 
+    @staticmethod
+    def _current_thread_id() -> str:
+        """取当前 thread_id 用于日志；不在图运行上下文里时返回 '-'"""
+        try:
+            config = get_config()
+            return str((config.get("configurable") or {}).get("thread_id") or "-")
+        except Exception:  # noqa: BLE001 - 日志辅助函数不允许抛异常
+            return "-"
+
+    def _try_get_sandbox(self):
+        """尽力取沙箱（仅为了在「执行开始前」就把 sandbox_id 打进日志）"""
+        try:
+            return self._get_sandbox()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        """批量下载文件内容，供 MemoryMiddleware 加载记忆文件使用"""
+        results = []
+        root = _workspace_root()
+        for path in paths:
+            try:
+                target = (root / path.lstrip("/")).resolve()
+                if not str(target).startswith(str(root)):
+                    results.append(FileDownloadResponse(
+                        path=path, content=None,
+                        error=f"路径逃逸拒绝: {path}"
+                    ))
+                    continue
+                if not target.exists():
+                    results.append(FileDownloadResponse(
+                        path=path, content=None,
+                        error="file_not_found"
+                    ))
+                    continue
+                content = target.read_bytes()
+                results.append(FileDownloadResponse(
+                    path=path, content=content, error=None
+                ))
+            except Exception as e:
+                results.append(FileDownloadResponse(
+                    path=path, content=None,
+                    error=str(e)
+                ))
+        return results
 
 __all__ = ["RestrictedSandboxBackend"]

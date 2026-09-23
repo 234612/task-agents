@@ -30,6 +30,7 @@ from typing import Any, Dict
 
 import redis
 import redis.asyncio as aioredis
+from daytona import Daytona, DaytonaConfig
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.store.mongodb import MongoDBStore
@@ -38,6 +39,7 @@ from pymongo import MongoClient
 
 from task_agents.core.config import Settings, get_settings
 from task_agents.database.engine import create_engine, create_session_factory, init_database
+from task_agents.sandbox.sandbox_manager import SandboxManager
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,15 @@ class ServiceContainer:
         )
         self.clients["mongo_store"] = mongo_store
         logger.info("MongoDB Store（长期记忆）初始化成功")
+
+        cfg = DaytonaConfig(
+            api_key=self.config.DAYTONA_API_KEY,
+            api_url=self.config.DAYTONA_API_URL,
+            target=self.config.DAYTONA_TARGET,
+        )
+        self.clients["daytona"] = Daytona(cfg)
+        self.clients["sandbox_manager"] = SandboxManager(self.clients["daytona"])
+        logger.info("Daytona 沙箱客户端初始化成功")
 
     async def _build_checkpointer(self):
         """按 CHECKPOINT_BACKEND 选择 checkpointer，auto 时按能力探测回落

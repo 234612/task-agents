@@ -1,5 +1,3 @@
-# agents/market_researcher_engine/agent.py
-
 from pathlib import Path
 
 from deepagents import create_deep_agent, SubAgent
@@ -19,7 +17,8 @@ def _load_prompt(name: str) -> str:
     return prompt_path.read_text(encoding="utf-8") + LEAF_AGENT_RULES
 
 
-def create_market_researcher(model: BaseChatModel, backend=None, store=None,memory=None, checkpointer=None):
+def create_market_researcher(model: BaseChatModel, backend=None, store=None, memory=None, checkpointer=None,
+                             middleware=None):
     base_dir = Path(__file__).parent
 
     # ==================== 子 Agent 定义 ====================
@@ -57,13 +56,14 @@ def create_market_researcher(model: BaseChatModel, backend=None, store=None,memo
     # ==================== 主 Agent ====================
     agent = create_deep_agent(
         model=model,
-        tools=[],  # 主 Agent 不持有工具，全部委派
+        tools=[],
         system_prompt=MARKET_RESEARCHER_PROMPT,
         subagents=subagents,
         backend=backend,
         store=store,
         memory=memory,
         checkpointer=checkpointer,
+        middleware=middleware or (),
         debug=False,
     )
 

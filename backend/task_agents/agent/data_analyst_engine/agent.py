@@ -27,7 +27,8 @@ def _load_prompt(name: str) -> str:
     return prompt_path.read_text(encoding="utf-8") + LEAF_AGENT_RULES
 
 
-def create_data_analyst(model: BaseChatModel, backend=None, store=None, memory=None, checkpointer=None):
+def create_data_analyst(model: BaseChatModel, backend=None, store=None, memory=None, checkpointer=None,
+                        middleware=None):
     subagents: list[SubAgent] = [
         {
             "name": "data_loader",
@@ -67,6 +68,7 @@ def create_data_analyst(model: BaseChatModel, backend=None, store=None, memory=N
         store=store,
         memory=memory,
         checkpointer=checkpointer,
+        middleware=middleware or (),
         debug=False,
     )
 

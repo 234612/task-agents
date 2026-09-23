@@ -37,7 +37,18 @@ class Settings(BaseSettings):
     # 小模型偶尔会陷入「重复委派 / 反复重试失败工具」的死循环，一条请求能跑
     # 上千步、烧掉几十万 token。设上限后可被 GraphRecursionError 截断，
     # 由 chat_service 转成 error 事件返回，而不是无限跑下去。
-    AGENT_RECURSION_LIMIT: int = 60
+    #
+    # 单位是 LangGraph 的 super-step：一次「模型 → 工具 → 模型」大约 2 步，
+    # 一次子 Agent 委派内部也要吃掉若干步。30 大致对应 10~15 个工具轮次，
+    # 够跑完「写文件 → 执行 → 修正 → 汇报」，又能把最坏开销压到 60 的一半。
+    # 真正防烧钱靠的是 TOOL_FAILURE_BREAK_THRESHOLD（连续失败熔断），
+    # 步数闸门只是最后兜底。
+    AGENT_RECURSION_LIMIT: int = 30
+
+    # 同一个工具 + 同一组参数连续失败多少次就熔断整轮运行。
+    # 这是防「环境出错 → 模型反复重试」烧 token 的主力开关；
+    # 设 0 或负数表示关闭熔断。
+    TOOL_FAILURE_BREAK_THRESHOLD: int = 3
 
 
 
@@ -87,6 +98,36 @@ class Settings(BaseSettings):
     # 会话列表分页默认值与上限
     SESSION_PAGE_SIZE: int = 20
     SESSION_PAGE_SIZE_MAX: int = 100
+
+
+
+    # ==================== 沙箱池实例 ====================
+    DAYTONA_API_KEY:str = ''
+    DAYTONA_API_URL:str = "https://app.daytona.io/api"
+    DAYTONA_TARGET:str = "us"
+
+    # ==================== 沙箱治理（1000 并发下的成本与容量闸门） ====================
+    # 约定：0 = 关闭 / 不限，保持当前行为；只有设成非 0 才启用对应策略。
+    # 这样先落地配置面，接线逻辑可以分次做，不会因为加了字段就改变线上行为。
+
+    # 全局同时存活的沙箱上限。0=不限。
+    # 1000 并发下若无上限，每个请求都会新建一个云沙箱，成本与资源都会失控。
+    SANDBOX_MAX_CONCURRENT: int = 0
+
+    # 单个 user_id 同时持有的沙箱上限。0=不限。防止单个用户打满全局池子
+    SANDBOX_MAX_PER_USER: int = 0
+
+    # 沙箱空闲多久后销毁（秒）。0=保持现状（每轮请求结束立即销毁）。
+    # 非 0 时配合会话级复用：release 只标记空闲，超时才真正销毁
+    SANDBOX_IDLE_TTL_SECONDS: int = 0
+
+    # 池满时最多排队等待多久（秒）。0=不等待，直接降级为"执行环境繁忙"
+    SANDBOX_ACQUIRE_TIMEOUT_SECONDS: int = 0
+
+    # 传给 Daytona 的 auto_stop_interval（分钟），远端兜底自动停止。
+    # 0=不自动停止（现状）。建议与 SANDBOX_IDLE_TTL_SECONDS 配套设成 15
+    SANDBOX_AUTO_STOP_MINUTES: int = 0
+
 
     # ==================== 程序员工具配置 ====================
     # 程序员子 Agent 的文件读写与代码执行能力，全部受沙箱约束。

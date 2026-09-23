@@ -23,7 +23,8 @@ def _load_prompt(name: str) -> str:
     return prompt_path.read_text(encoding="utf-8") + LEAF_AGENT_RULES
 
 
-def create_content_writer(model: BaseChatModel, backend=None, store=None, memory=None, checkpointer=None):
+def create_content_writer(model: BaseChatModel, backend=None, store=None, memory=None, checkpointer=None,
+                          middleware=None):
     subagents: list[SubAgent] = [
         {
             "name": "outliner",
@@ -63,6 +64,7 @@ def create_content_writer(model: BaseChatModel, backend=None, store=None, memory
         store=store,
         memory=memory,
         checkpointer=checkpointer,
+        middleware=middleware or (),
         debug=False,
     )
 

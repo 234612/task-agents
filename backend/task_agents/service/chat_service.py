@@ -30,7 +30,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
+from task_agents.agent.middleware.loop_breaker import tool_failure_breaker
 from task_agents.core.config import get_settings
+from task_agents.sandbox.sandbox_registry import ensure_pool
 from task_agents.schemas.mongo import (
     Citation,
     StoredMessage,
@@ -164,7 +166,18 @@ class ChatService:
             final_session_id, user_id, agent_key, created,
         )
 
-        reply_text, tool_calls = await self._invoke_agent(agent, final_session_id, user_id, content)
+        # —— 沙箱池：请求前为该 thread（=session_id）分配独占沙箱 ——
+        # Thread-scoped 隔离：工具调用（含子 Agent）都经由 ThreadScopedBackend
+        # 按 thread_id 路由到池中该会话的沙箱；请求结束 release 时「先回收产物再销毁」。
+        pool = await ensure_pool()
+        await pool.acquire(final_session_id)
+        # 新一轮对话：清掉上一轮残留的失败计数，否则一次熔断会卡死整个会话
+        tool_failure_breaker.reset(final_session_id)
+        try:
+            reply_text, tool_calls = await self._invoke_agent(agent, final_session_id, user_id, content)
+        finally:
+            # 无论成功或异常，都回收产物并销毁沙箱（release 内部先 recover 再 cleanup）
+            await pool.release(final_session_id)
 
         turn: TurnRecord = await self._messages.record_turn(
             session_id=final_session_id,
@@ -307,101 +320,108 @@ class ChatService:
                 返回最新 message_count。由路由层注入 persist_turn，
                 使服务层不依赖 FastAPI 的 app 对象。
         """
-        # —— 首帧：会话元数据（自动创建的 session_id 通过它回传前端） ——
-        yield _format_sse({
-            "type": "meta",
-            "session_id": session_id,
-            "created": created,
-        })
-
-        accumulated = ""
-        tool_calls: list[ToolCall] = []
-        thinking_steps: list[ThinkingStep] = []
-        citations: list[Citation] = []
-        seen_tool_call_ids: set[str] = set()
-        completed = False
-
+        pool = await ensure_pool()
+        await pool.acquire(session_id)
+        tool_failure_breaker.reset(session_id)
         try:
-            messages = await self._seed_context(session_id, content)
-            stream_config = self._thread_config(session_id, user_id)
+            # —— 首帧：会话元数据（自动创建的 session_id 通过它回传前端） ——
+            yield _format_sse({
+                "type": "meta",
+                "session_id": session_id,
+                "created": created,
+            })
 
-            logger.info(
-                "开始流式聊天(持久化): user_id=%s session_id=%s 回灌消息=%s",
-                user_id, session_id, len(messages) - 1,
-            )
+            accumulated = ""
+            tool_calls: list[ToolCall] = []
+            thinking_steps: list[ThinkingStep] = []
+            citations: list[Citation] = []
+            seen_tool_call_ids: set[str] = set()
+            completed = False
 
-            async for chunk_type, chunk_data in agent.astream(
-                {"messages": messages},
-                stream_config,
-                stream_mode=["messages", "updates"],
-            ):
-                # —— content：模型 token 增量（打字机效果） ——
-                if chunk_type == "messages":
-                    msg = chunk_data[0]
-                    piece = self._extract_text(self._get_field(msg, "content"))
-                    if piece:
-                        # 累积口径与前端展示完全一致，保证「看到的」=「落库的」
-                        accumulated += piece
-                        yield _format_sse({"type": "content", "content": piece})
+            try:
+                messages = await self._seed_context(session_id, content)
+                stream_config = self._thread_config(session_id, user_id)
 
-                # —— updates：节点产物 → thinking / tool_call / tool_result ——
-                elif chunk_type == "updates":
-                    for evt in self._parse_node_update(chunk_data):
-                        if evt["type"] == "tool_call":
-                            calls = evt["_calls"]
-                            # messages 模式里模型分片可能重复携带同一批
-                            # tool_calls，按 id 去重后再累计
-                            for call in calls:
-                                key = call.id or f"{call.name}:{json.dumps(call.args, sort_keys=True, default=str)[:80]}"
-                                if key not in seen_tool_call_ids:
-                                    seen_tool_call_ids.add(key)
-                                    tool_calls.append(call)
-                                    if call.name == "extract_web_content" and call.args.get("url"):
-                                        citations.append(_citation_from_url(str(call.args["url"])))
-                            yield _format_sse({
-                                "type": "tool_call",
-                                "id": [c.id for c in calls],
-                                "name": [c.name for c in calls],
-                                "args": [c.args for c in calls],
-                            })
-                        else:
-                            if evt["type"] == "thinking":
-                                thinking_steps.append(
-                                    ThinkingStep(node=evt["node"], summary=evt["summary"])
-                                )
-                            yield _format_sse(evt)
+                logger.info(
+                    "开始流式聊天(持久化): user_id=%s session_id=%s 回灌消息=%s",
+                    user_id, session_id, len(messages) - 1,
+                )
 
-            completed = True
+                async for chunk_type, chunk_data in agent.astream(
+                    {"messages": messages},
+                    stream_config,
+                    stream_mode=["messages", "updates"],
+                ):
+                    # —— content：模型 token 增量（打字机效果） ——
+                    if chunk_type == "messages":
+                        msg = chunk_data[0]
+                        piece = self._extract_text(self._get_field(msg, "content"))
+                        if piece:
+                            # 累积口径与前端展示完全一致，保证「看到的」=「落库的」
+                            accumulated += piece
+                            yield _format_sse({"type": "content", "content": piece})
 
-        except Exception as e:
-            logger.exception("流式聊天异常: session_id=%s", session_id)
-            yield _format_sse({"type": "error", "message": str(e)})
-            return
+                    # —— updates：节点产物 → thinking / tool_call / tool_result ——
+                    elif chunk_type == "updates":
+                        for evt in self._parse_node_update(chunk_data):
+                            if evt["type"] == "tool_call":
+                                calls = evt["_calls"]
+                                # messages 模式里模型分片可能重复携带同一批
+                                # tool_calls，按 id 去重后再累计
+                                for call in calls:
+                                    key = call.id or f"{call.name}:{json.dumps(call.args, sort_keys=True, default=str)[:80]}"
+                                    if key not in seen_tool_call_ids:
+                                        seen_tool_call_ids.add(key)
+                                        tool_calls.append(call)
+                                        if call.name == "extract_web_content" and call.args.get("url"):
+                                            citations.append(_citation_from_url(str(call.args["url"])))
+                                yield _format_sse({
+                                    "type": "tool_call",
+                                    "id": [c.id for c in calls],
+                                    "name": [c.name for c in calls],
+                                    "args": [c.args for c in calls],
+                                })
+                            else:
+                                if evt["type"] == "thinking":
+                                    thinking_steps.append(
+                                        ThinkingStep(node=evt["node"], summary=evt["summary"])
+                                    )
+                                yield _format_sse(evt)
 
-        if not completed:
-            return
+                completed = True
 
-        # —— 流式推送完毕，执行三存储持久化 ——
-        message_count: Optional[int] = None
-        persisted = True
-        try:
-            message_count = await on_complete(accumulated, tool_calls, thinking_steps, citations)
-            persisted = message_count is not None
-        except Exception:
-            logger.exception("流式对话持久化失败: session_id=%s", session_id)
-            persisted = False
+            except Exception as e:
+                logger.exception("流式聊天异常: session_id=%s", session_id)
+                yield _format_sse({"type": "error", "message": str(e)})
+                return
 
-        if not persisted:
-            logger.error(
-                "回复已推送但持久化失败，历史中可能缺失本轮: session_id=%s", session_id
-            )
+            if not completed:
+                return
 
-        yield _format_sse({
-            "type": "done",
-            "persisted": persisted,
-            "message_count": message_count,
-            "session_id": session_id,
-        })
+            # —— 流式推送完毕，执行三存储持久化 ——
+            message_count: Optional[int] = None
+            persisted = True
+            try:
+                message_count = await on_complete(accumulated, tool_calls, thinking_steps, citations)
+                persisted = message_count is not None
+            except Exception:
+                logger.exception("流式对话持久化失败: session_id=%s", session_id)
+                persisted = False
+
+            if not persisted:
+                logger.error(
+                    "回复已推送但持久化失败，历史中可能缺失本轮: session_id=%s", session_id
+                )
+
+            yield _format_sse({
+                "type": "done",
+                "persisted": persisted,
+                "message_count": message_count,
+                "session_id": session_id,
+            })
+        finally:
+            pass
+            # await pool.release(session_id)
 
     @staticmethod
     def _parse_node_update(chunk_data: Any) -> list[dict]:

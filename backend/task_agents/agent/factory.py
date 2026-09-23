@@ -4,16 +4,16 @@ Agent 工厂模块
 """
 
 import logging
-import time
 from dataclasses import dataclass
 from typing import Dict, Any
-from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
 from task_agents.agent.code_engineer_engine.agent import create_code_engineer
 from task_agents.agent.content_writer_engine.agent import create_content_writer
 from task_agents.agent.data_analyst_engine.agent import create_data_analyst
 from task_agents.agent.market_researcher_engine.agent import create_market_researcher
 from task_agents.agent.sandbox_backend import RestrictedSandboxBackend
 from task_agents.core.services import service_container as container
+from task_agents.agent.middleware.loop_breaker import tool_failure_breaker
+# from task_agents.sandbox import sandbox_manager
 
 logger = logging.getLogger(__name__)
 
@@ -41,22 +41,20 @@ def build_agents() -> Dict[str, Any]:
     llm = container.get_client('llm')
     checkpointer = container.get_client('redis_checkpointer')
     store = container.get_client("mongo_store")
+    sandbox_manager = container.get_client("sandbox_manager")
+
+    # 熔断阈值来自配置；中间件是进程级单例，装配时同步一次即可
+    tool_failure_breaker.threshold = container.config.TOOL_FAILURE_BREAK_THRESHOLD
 
     try:
-        # 所有引擎共用同一套基础设施：LLM / checkpointer（短期记忆）/ store（长期记忆）。
-        # 差异只在 system_prompt 与子 Agent 组合，因此逐个装配即可。
-        # backend 决定 deepagents 内置的 ls/read_file/write_file/execute 落在哪。
-        # 不用 StateBackend()：它没有 execute（模型一调就报错并陷入重试死循环），
-        # 且文件系统是内存虚拟的、写的文件根本不落盘。
-        # 也不用官方 LocalShellBackend：它 shell=True 无隔离，能读 .env 里的密钥。
-        # RestrictedSandboxBackend = 真实 workspace 目录（virtual_mode 封锁逃逸）
-        # + 仅允许 Python 的受限执行。详见该模块 docstring。
         common = dict(
             model=llm,
             checkpointer=checkpointer,
             store=store,
             memory=["/memories/preferences.md"],  # ← 虚拟路径
-            backend=RestrictedSandboxBackend(),
+            backend=RestrictedSandboxBackend(sandbox_manager),
+            # 连续失败熔断：防小模型对着同一个环境错误反复重试烧 token
+            middleware=[tool_failure_breaker],
         )
 
         _REGISTRY["market_researcher"] = create_market_researcher(**common)

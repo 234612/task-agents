@@ -2,7 +2,24 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Custom scrollbar for chat area */
+@layer base {
+  html {
+    background-color: theme('colors.canvas');
+  }
+
+  body {
+    background-color: theme('colors.canvas');
+    color: theme('colors.ink');
+  }
+
+  /* 选中文本：墨色底 + 奶油字，与深色 TUI 卡呼应 */
+  ::selection {
+    background-color: theme('colors.ink');
+    color: theme('colors.canvas');
+  }
+}
+
+/* Custom scrollbar：灰阶单色，无高饱和强调 */
 .overflow-y-auto::-webkit-scrollbar {
   width: 6px;
 }
@@ -12,10 +29,26 @@
 }
 
 .overflow-y-auto::-webkit-scrollbar-thumb {
-  background-color: #cbd5e1;
+  background-color: theme('colors.ash');
   border-radius: 3px;
 }
 
 .overflow-y-auto::-webkit-scrollbar-thumb:hover {
-  background-color: #94a3b8;
+  background-color: theme('colors.hairline-strong');
+}
+
+/* 终端光标：流式生成 / 思考中的闪烁块 */
+.cursor-blink {
+  animation: cursor-blink 1s steps(1, end) infinite;
+}
+
+@keyframes cursor-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
 }

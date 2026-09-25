@@ -1,20 +1,6 @@
 'use client';
 
 import { useState, KeyboardEvent, useRef, useEffect } from 'react';
-import {
-  Send,
-  Square,
-  Plus,
-  GitBranch,
-  ChevronDown,
-  Mic,
-  Loader2,
-  ShieldCheck,
-  FileText,
-  Image as ImageIcon,
-  Code2,
-  type LucideIcon,
-} from 'lucide-react';
 import { AgentRole, AGENTS } from '@/types';
 import { cn } from '@/lib/utils';
 
@@ -38,16 +24,19 @@ interface InputAreaProps {
 }
 
 const PERMISSION_OPTIONS = ['允许完全访问', '仅读文件', '仅对话'] as const;
-const ATTACHMENT_OPTIONS: { icon: LucideIcon; label: string }[] = [
-  { icon: FileText, label: '上传文件' },
-  { icon: ImageIcon, label: '上传图片' },
-  { icon: Code2, label: '引用代码仓库' },
+const ATTACHMENT_OPTIONS: { glyph: string; label: string }[] = [
+  { glyph: '[file]', label: '上传文件' },
+  { glyph: '[img]', label: '上传图片' },
+  { glyph: '[repo]', label: '引用代码仓库' },
 ];
 
 /** 把 token 数格式化为 K 单位，保留 1 位小数 */
 function formatK(n: number): string {
   return `${(n / 1000).toFixed(1)}K`;
 }
+
+const MENU_BASE =
+  'absolute bottom-full z-20 mb-1 overflow-hidden rounded-sm border border-hairline bg-canvas py-1';
 
 export function InputArea({
   onSend,
@@ -117,43 +106,39 @@ export function InputArea({
   const currentAgent = AGENTS.find((a) => a.role === currentAgentRole)!;
 
   return (
-    <div className="border-t border-slate-200 bg-slate-50 px-4 py-3">
+    <div className="border-t border-hairline bg-canvas px-4 py-3">
       <div className="mx-auto max-w-3xl">
-        {/* 整体圆角卡片 */}
-        <div className="relative rounded-2xl border border-slate-200 bg-white shadow-sm transition focus-within:border-indigo-300 focus-within:shadow-md">
+        {/* prompt-row：发丝线边框卡片，聚焦时边框转 ink */}
+        <div className="relative rounded-sm border border-hairline bg-canvas transition focus-within:border-ink">
           <div className="p-3">
-            {/* ===== 顶部：输入框主体 ===== */}
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              onInput={handleInput}
-              placeholder="今天帮你做些什么？"
-              rows={1}
-              className="block w-full resize-none bg-transparent px-1 py-1 text-sm leading-relaxed text-slate-800 placeholder-slate-400 focus:outline-none"
-            />
-            <p className="px-1 text-xs text-slate-400">
-              @ 引用对话文件 / 调用技能与指令
-            </p>
-
-            {/* ===== 中部（右侧）：上下文 / Token 使用量状态胶囊 ===== */}
-            <div className="pointer-events-none absolute bottom-[58px] right-3">
-              <div className="group relative">
-                <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-500">
-                  {contextUsage.percent.toFixed(1)}% ·{' '}
-                  {formatK(contextUsage.used)} / {formatK(contextUsage.total)} 上下文已使用
-                </span>
-                {/* 悬停 Tooltip */}
-                <div className="pointer-events-none absolute bottom-full right-0 mb-1 hidden whitespace-nowrap rounded-md bg-slate-800 px-2 py-1 text-[11px] text-white shadow-md group-hover:block">
-                  上下文窗口：{contextUsage.used.toLocaleString()} /{' '}
-                  {contextUsage.total.toLocaleString()} tokens
-                </div>
-              </div>
+            {/* ===== 顶部：prompt 输入行 ===== */}
+            <div className="flex items-start gap-1.5">
+              <span aria-hidden className="select-none pt-1 text-sm text-mute">❯</span>
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                onInput={handleInput}
+                placeholder={`task ${currentAgent.name} --输入任务描述`}
+                rows={1}
+                className="block w-full resize-none bg-transparent px-1 py-1 text-sm leading-relaxed text-ink placeholder-ash focus:outline-none"
+              />
+            </div>
+            <div className="flex items-baseline justify-between pl-4 text-[11px]">
+              <span className="text-ash">@ 引用对话文件 / 调用技能与指令</span>
+              {/* 上下文 / Token 使用量状态 */}
+              <span
+                className="cursor-help text-mute"
+                title={`上下文窗口：${contextUsage.used.toLocaleString()} / ${contextUsage.total.toLocaleString()} tokens`}
+              >
+                [ctx {contextUsage.percent.toFixed(1)}% · {formatK(contextUsage.used)} /{' '}
+                {formatK(contextUsage.total)}]
+              </span>
             </div>
 
             {/* ===== 底部：工具栏 ===== */}
-            <div className="mt-2 flex items-center justify-between">
+            <div className="mt-2.5 flex items-center justify-between">
               {/* 左侧：+ 附件 / Git 分支 / 权限下拉 */}
               <div className="flex items-center gap-1">
                 {/* + 附件菜单 */}
@@ -163,36 +148,27 @@ export function InputArea({
                       setShowAttachMenu(!showAttachMenu);
                       setShowAgentMenu(false);
                     }}
-                    className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+                    className="flex h-8 items-center rounded-sm px-2 text-xs text-mute transition hover:bg-surface-soft hover:text-ink"
                     title="添加附件"
                   >
-                    <Plus className="h-4 w-4" />
+                    [+]
                   </button>
                   {showAttachMenu && (
-                    <div className="absolute bottom-full left-0 z-20 mb-1 w-40 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
+                    <div className={cn(MENU_BASE, 'left-0 w-44')}>
                       {ATTACHMENT_OPTIONS.map((opt) => (
                         <button
                           key={opt.label}
                           onClick={() => setShowAttachMenu(false)}
-                          className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-slate-600 transition hover:bg-slate-50"
+                          className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-body transition hover:bg-surface-soft hover:text-ink"
                         >
-                          <opt.icon className="h-4 w-4 text-slate-400" />
+                          <span aria-hidden className="text-ash">{opt.glyph}</span>
                           {opt.label}
                         </button>
                       ))}
                     </div>
                   )}
                 </div>
-
-                {/* Git 分支 */}
-                <button
-                  className="flex h-8 items-center gap-1.5 rounded-lg px-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
-                  title="当前分支"
-                >
-                  <GitBranch className="h-4 w-4" />
-                  <span className="text-xs font-medium">main</span>
-                </button>
-
+                
                 {/* 权限下拉 */}
                 <div className="relative" ref={permissionMenuRef}>
                   <button
@@ -201,15 +177,13 @@ export function InputArea({
                       setShowAttachMenu(false);
                       setShowAgentMenu(false);
                     }}
-                    className="flex h-8 items-center gap-1 rounded-lg px-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+                    className="flex h-8 items-center rounded-sm px-2 text-xs text-mute transition hover:bg-surface-soft hover:text-ink"
                     title="访问权限"
                   >
-                    <ShieldCheck className="h-4 w-4" />
-                    <span className="text-xs font-medium">{permission}</span>
-                    <ChevronDown className="h-3 w-3" />
+                    [access:{permission} <span aria-hidden>▾</span>]
                   </button>
                   {showPermissionMenu && (
-                    <div className="absolute bottom-full left-0 z-20 mb-1 w-36 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
+                    <div className={cn(MENU_BASE, 'left-0 w-40')}>
                       {PERMISSION_OPTIONS.map((opt) => (
                         <button
                           key={opt}
@@ -218,12 +192,15 @@ export function InputArea({
                             setShowPermissionMenu(false);
                           }}
                           className={cn(
-                            'flex w-full items-center px-3 py-2 text-left text-sm transition',
+                            'flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition',
                             permission === opt
-                              ? 'bg-indigo-50 text-indigo-700'
-                              : 'text-slate-600 hover:bg-slate-50'
+                              ? 'bg-surface-soft font-semibold text-ink'
+                              : 'text-body hover:bg-surface-soft hover:text-ink'
                           )}
                         >
+                          {permission === opt && (
+                            <span aria-hidden className="text-accent">✓</span>
+                          )}
                           {opt}
                         </button>
                       ))}
@@ -232,11 +209,11 @@ export function InputArea({
                 </div>
               </div>
 
-              {/* 右侧：思考圈 / 模型·Agent 选择器 / 语音 / 发送 */}
+              {/* 右侧：思考指示 / 模型·Agent 选择器 / 语音 / 发送 */}
               <div className="flex items-center gap-1.5">
-                {/* 思考加载圈 */}
+                {/* 思考加载指示 */}
                 {isLoading && (
-                  <Loader2 className="h-4 w-4 animate-spin text-indigo-500" />
+                  <span aria-hidden className="animate-pulse text-sm text-accent">⟳</span>
                 )}
 
                 {/* 模型 / Agent 选择器 */}
@@ -246,72 +223,78 @@ export function InputArea({
                       setShowAgentMenu(!showAgentMenu);
                       setShowAttachMenu(false);
                     }}
-                    className="flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-600 transition hover:bg-slate-50"
+                    className="flex h-8 items-center gap-1.5 rounded-sm border border-hairline bg-canvas px-2.5 text-xs text-body transition hover:bg-surface-soft hover:text-ink"
                     title="切换 Agent / 模型"
                   >
-                    <span>{currentAgent.avatar}</span>
-                    <span>{currentAgent.name}</span>
-                    <ChevronDown className="h-3 w-3 text-slate-400" />
+                    [agent:{currentAgent.name} <span aria-hidden>▾</span>]
                   </button>
                   {showAgentMenu && (
-                    <div className="absolute bottom-full right-0 z-20 mb-1 w-56 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
-                      {AGENTS.map((agent) => (
-                        <button
-                          key={agent.role}
-                          onClick={() => {
-                            onAgentChange(agent.role);
-                            setShowAgentMenu(false);
-                          }}
-                          className={cn(
-                            'flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm transition',
-                            currentAgentRole === agent.role
-                              ? 'bg-indigo-50 text-indigo-700'
-                              : 'text-slate-700 hover:bg-slate-50'
-                          )}
-                        >
-                          <span className="text-base">{agent.avatar}</span>
-                          <div className="min-w-0">
-                            <div className="font-medium">{agent.name}</div>
-                            <div className="truncate text-xs text-slate-400">
-                              {agent.description}
-                            </div>
-                          </div>
-                        </button>
-                      ))}
+                    <div className={cn(MENU_BASE, 'right-0 w-64')}>
+                      {AGENTS.map((agent) => {
+                        const isActive = currentAgentRole === agent.role;
+                        return (
+                          <button
+                            key={agent.role}
+                            onClick={() => {
+                              onAgentChange(agent.role);
+                              setShowAgentMenu(false);
+                            }}
+                            className={cn(
+                              'flex w-full items-start gap-2 px-3 py-2.5 text-left text-xs transition',
+                              isActive
+                                ? 'bg-surface-soft text-ink'
+                                : 'text-body hover:bg-surface-soft hover:text-ink'
+                            )}
+                          >
+                            <span aria-hidden className={cn('mt-px shrink-0', isActive ? 'text-accent' : 'text-ash')}>
+                              {isActive ? '✓' : '·'}
+                            </span>
+                            <span className="min-w-0">
+                              <span className="block font-bold">
+                                {agent.name}
+                                <span className="ml-1.5 font-normal text-ash">[{agent.role}]</span>
+                              </span>
+                              <span className="mt-0.5 block truncate leading-relaxed text-mute">
+                                {agent.description}
+                              </span>
+                            </span>
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
 
                 {/* 语音输入 */}
                 <button
-                  className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+                  className="flex h-8 items-center rounded-sm px-2 text-xs text-mute transition hover:bg-surface-soft hover:text-ink"
                   title="语音输入"
                 >
-                  <Mic className="h-4 w-4" />
+                  [voice]
                 </button>
 
-                {/* 发送按钮（圆形品牌色，空时禁用） */}
+                {/* 发送按钮（墨色方块，空时禁用）；生成中变停止 */}
                 {isLoading ? (
                   <button
                     onClick={onStop}
-                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-red-500 text-white transition hover:bg-red-600"
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-sm bg-danger text-white transition hover:bg-danger-hover active:bg-danger-active"
                     title="停止生成"
                   >
-                    <Square className="h-4 w-4 fill-current" />
+                    <span aria-hidden className="text-sm">■</span>
                   </button>
                 ) : (
                   <button
                     onClick={handleSend}
                     disabled={!input.trim()}
                     className={cn(
-                      'flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition',
+                      'flex h-9 w-9 shrink-0 items-center justify-center rounded-sm text-sm transition',
                       input.trim()
-                        ? 'bg-indigo-600 text-white hover:bg-indigo-700'
-                        : 'cursor-not-allowed bg-slate-200 text-slate-400'
+                        ? 'bg-ink text-canvas hover:bg-charcoal active:bg-ink-deep'
+                        : 'cursor-not-allowed bg-surface-card text-ash'
                     )}
                     title="发送"
                   >
-                    <Send className="h-4 w-4" />
+                    <span aria-hidden>↵</span>
                   </button>
                 )}
               </div>

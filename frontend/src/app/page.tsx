@@ -149,7 +149,7 @@ export default function Home() {
   const errorMessage = chatError ?? sessionError;
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-white">
+    <div className="flex h-screen w-screen overflow-hidden bg-canvas">
       <Sidebar
         sessions={sessions}
         activeSessionId={activeSessionId}

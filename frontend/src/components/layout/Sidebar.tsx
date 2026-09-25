@@ -1,8 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import { History, MessageSquarePlus, Plus, Settings, Trash2, User } from 'lucide-react';
 
+import { AscWordmark } from '@/components/AscWordmark';
 import { cn } from '@/lib/utils';
 import type { ChatSession } from '@/types';
 
@@ -51,47 +51,49 @@ export function Sidebar({
   const [hoveredId, setHoveredId] = useState<string | null>(null);
 
   return (
-    <aside className="flex h-screen w-64 flex-col border-r border-slate-200 bg-slate-50">
-      {/* Logo */}
-      <div className="flex items-center gap-2 px-4 py-5">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-sm font-bold text-white">
-          MA
+    <aside className="flex h-screen w-64 flex-col border-r border-hairline bg-canvas">
+      {/* Logo：块像素 wordmark + 产品名 */}
+      <div className="flex items-center gap-2.5 px-4 py-5">
+        <AscWordmark className="text-ink" />
+        <div className="min-w-0">
+          <div className="truncate text-sm font-bold text-ink">task_agents</div>
+          <div className="text-[11px] text-ash">multi-agent terminal</div>
         </div>
-        <span className="text-base font-semibold text-slate-800">Multi-Agent</span>
       </div>
 
       {/* New Chat Button */}
       <div className="px-3 py-2">
         <button
           onClick={onNewChat}
-          className="flex w-full items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-700 active:bg-indigo-800"
+          className="flex h-9 w-full items-center justify-center gap-2 rounded-sm bg-ink text-sm font-medium text-canvas transition hover:bg-charcoal active:bg-ink-deep"
         >
-          <Plus className="h-4 w-4" />
+          <span aria-hidden>[+]</span>
           新建对话
         </button>
       </div>
 
       {/* Session List */}
       <div className="flex-1 overflow-y-auto px-3 py-2">
-        <div className="mb-2 flex items-center gap-1.5 px-2 text-xs font-medium uppercase tracking-wider text-slate-400">
-          <History className="h-3.5 w-3.5" />
-          历史会话
+        <div className="mb-2 flex items-baseline justify-between px-1 text-[11px] font-medium uppercase tracking-[0.2em] text-mute">
+          <span>[sessions]</span>
+          {!isLoading && sessions.length > 0 && (
+            <span className="normal-case tracking-normal text-ash">{sessions.length}</span>
+          )}
         </div>
 
         {isLoading ? (
           // 骨架屏：比转圈更接近最终布局，减少视觉跳动
           <ul className="space-y-1.5 px-1">
             {[0, 1, 2, 3].map((i) => (
-              <li key={i} className="h-9 animate-pulse rounded-md bg-slate-200/70" />
+              <li key={i} className="h-9 animate-pulse rounded-sm bg-surface-card" />
             ))}
           </ul>
         ) : sessions.length === 0 ? (
           <div className="mt-6 flex flex-col items-center gap-2 px-4 text-center">
-            <MessageSquarePlus className="h-7 w-7 text-slate-300" />
-            <p className="text-xs leading-relaxed text-slate-400">
-              还没有会话记录
+            <p className="text-xs leading-relaxed text-mute">
+              [-] 还没有会话记录
               <br />
-              点击上方「新建对话」开始
+              点击上方 [新建对话] 开始
             </p>
           </div>
         ) : (
@@ -110,17 +112,20 @@ export function Sidebar({
                   <button
                     onClick={() => onSelectSession(session.id)}
                     className={cn(
-                      'w-full rounded-md py-2 pl-2.5 pr-8 text-left transition',
+                      'w-full rounded-none py-2 pl-1 pr-8 text-left transition',
                       isActive
-                        ? 'bg-white text-indigo-600 shadow-sm'
-                        : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                        ? 'bg-surface-soft text-ink'
+                        : 'text-body hover:bg-surface-soft hover:text-ink'
                     )}
                   >
-                    <div className="truncate text-sm">{session.title}</div>
+                    <div className="truncate pl-2 text-sm">
+                      {isActive && <span aria-hidden className="mr-1.5 text-mute">❯</span>}
+                      {session.title}
+                    </div>
                     <div
                       className={cn(
-                        'mt-0.5 truncate text-[10px]',
-                        isActive ? 'text-indigo-400' : 'text-slate-400'
+                        'mt-0.5 truncate pl-2 text-[11px]',
+                        isActive ? 'text-mute' : 'text-ash'
                       )}
                     >
                       {formatRelativeTime(session.lastMessageAt)}
@@ -138,9 +143,9 @@ export function Sidebar({
                         void onDeleteSession(session.id);
                       }}
                       title="删除会话"
-                      className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 transition hover:bg-red-50 hover:text-red-500"
+                      className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-sm p-1 text-mute transition hover:bg-surface-card hover:text-danger"
                     >
-                      <Trash2 className="h-3.5 w-3.5" />
+                      <span aria-hidden className="text-xs">[x]</span>
                     </button>
                   )}
                 </li>
@@ -151,15 +156,13 @@ export function Sidebar({
       </div>
 
       {/* User Section */}
-      <div className="border-t border-slate-200 px-3 py-3">
-        <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-sm text-slate-600 transition hover:bg-slate-100 hover:text-slate-900">
-          <User className="h-4 w-4" />
-          <span className="flex-1 truncate text-left">
-            {userId ?? '未登录'}
-          </span>
-          <Settings className="h-4 w-4 shrink-0" />
+      <div className="border-t border-hairline px-3 py-3">
+        <button className="flex w-full items-center gap-2 rounded-sm px-2 py-2 text-sm text-body transition hover:bg-surface-soft hover:text-ink">
+          <span aria-hidden className="text-mute">[user]</span>
+          <span className="flex-1 truncate text-left">{userId ?? '未登录'}</span>
+          <span aria-hidden className="shrink-0 text-xs text-mute">[cfg]</span>
         </button>
-        <p className="mt-1 px-2 text-[10px] text-slate-400">
+        <p className="mt-1 px-2 text-[10px] leading-relaxed text-ash">
           登录功能开发中，当前为固定演示账号
         </p>
       </div>

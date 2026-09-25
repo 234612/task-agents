@@ -3,7 +3,7 @@ import type { Metadata } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'Task Agents',
+  title: 'task_agents',
   description: '多 Agent 协作对话助手',
 }
 

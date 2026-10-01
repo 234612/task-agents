@@ -13,6 +13,10 @@ from task_agents.agent.market_researcher_engine.agent import create_market_resea
 from task_agents.agent.sandbox_backend import RestrictedSandboxBackend
 from task_agents.core.services import service_container as container
 from task_agents.agent.middleware.loop_breaker import tool_failure_breaker
+from task_agents.agent.middleware.observability import (
+    observability_middleware,
+    run_observer,
+)
 # from task_agents.sandbox import sandbox_manager
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,12 @@ def build_agents() -> Dict[str, Any]:
     # 熔断阈值来自配置；中间件是进程级单例，装配时同步一次即可
     tool_failure_breaker.threshold = container.config.TOOL_FAILURE_BREAK_THRESHOLD
 
+    # 观测：绑定 Mongo 后才落库；绑定失败（如 Mongo 不可用）只影响观测，不影响对话
+    try:
+        run_observer.bind(container.get_client("mongo_db"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("观测未绑定 Mongo，span 将只记日志: %s", e)
+
     try:
         common = dict(
             model=llm,
@@ -53,8 +63,8 @@ def build_agents() -> Dict[str, Any]:
             store=store,
             memory=["/memories/preferences.md"],  # ← 虚拟路径
             backend=RestrictedSandboxBackend(sandbox_manager),
-            # 连续失败熔断：防小模型对着同一个环境错误反复重试烧 token
-            middleware=[tool_failure_breaker],
+            # 顺序敏感：熔断在前（控制流先截断），观测在后（只记录不改变结果）
+            middleware=[tool_failure_breaker, observability_middleware],
         )
 
         _REGISTRY["market_researcher"] = create_market_researcher(**common)

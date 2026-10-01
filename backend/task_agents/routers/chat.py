@@ -31,8 +31,10 @@ from task_agents.schemas.mongo import Citation, ThinkingStep, ToolCall
 from task_agents.service.background import (
     backfill_title,
     get_message_count,
+    persist_assistant_message,
     persist_messages,
     persist_turn,
+    persist_user_message,
 )
 from task_agents.service.chat_service import AgentNotFoundError
 from task_agents.service.dependencies import ChatServiceDep
@@ -97,7 +99,18 @@ async def chat_stream(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
     # —— 3. 首轮判定：用于决定是否在流结束后回填标题 ——
+    # 必须在落用户消息之前判定，否则计数已经 +1，首轮会被误判成非首轮
     is_first_turn = (await get_message_count(app, session_id)) == 0
+
+    # —— 3.1 L0：用户消息先落库 ——
+    # 原来 user + assistant 在整轮结束后一起写，中途断连（刷新页面）会把
+    # 整轮都丢掉。先落库后，最坏只是多一条没有回复的用户消息，可一键重发。
+    await persist_user_message(
+        app,
+        session_id=session_id,
+        user_id=payload.user_id,
+        user_content=payload.message,
+    )
 
     # —— 4. 持久化回调：流式生成器内部调用，自建连接不复用请求会话 ——
     async def on_complete(
@@ -106,11 +119,11 @@ async def chat_stream(
         thinking_steps: list[ThinkingStep],
         citations: list[Citation],
     ) -> Optional[int]:
-        count = await persist_turn(
+        # 用户消息已在 3.1 落库，这里只补助手消息
+        count = await persist_assistant_message(
             app,
             session_id=session_id,
             user_id=payload.user_id,
-            user_content=payload.message,
             assistant_content=assistant_text,
             assistant_tool_calls=tool_calls,
             assistant_thinking_steps=thinking_steps,
@@ -131,6 +144,7 @@ async def chat_stream(
             user_id=payload.user_id,
             created=created,
             on_complete=on_complete,
+            agent_key=payload.agent_key,
         ),
         media_type="text/event-stream",
         headers={

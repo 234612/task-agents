@@ -27,10 +27,12 @@ SSE 事件协议（所有帧均为 data: {JSON}，type 字段区分）：
 """
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
 from task_agents.agent.middleware.loop_breaker import tool_failure_breaker
+from task_agents.agent.middleware.observability import run_observer
 from task_agents.core.config import get_settings
 from task_agents.sandbox.sandbox_registry import ensure_pool
 from task_agents.schemas.mongo import (
@@ -170,14 +172,27 @@ class ChatService:
         # Thread-scoped 隔离：工具调用（含子 Agent）都经由 ThreadScopedBackend
         # 按 thread_id 路由到池中该会话的沙箱；请求结束 release 时「先回收产物再销毁」。
         pool = await ensure_pool()
-        await pool.acquire(final_session_id)
+        await pool.acquire(final_session_id, user_id)
         # 新一轮对话：清掉上一轮残留的失败计数，否则一次熔断会卡死整个会话
         tool_failure_breaker.reset(final_session_id)
+
+        # run_id：一次执行的唯一标识，贯穿观测 span / 沙箱日志 / SSE 事件。
+        # 客户端生成是后续重连方案的目标形态（见 ROADMAP 第五节），
+        # 当前由服务端生成，先把串联链路打通。
+        run_id = str(uuid.uuid4())
+        run_observer.start(run_id, final_session_id, user_id, agent_key)
+        status, error_text = "ok", None
         try:
-            reply_text, tool_calls = await self._invoke_agent(agent, final_session_id, user_id, content)
+            reply_text, tool_calls = await self._invoke_agent(
+                agent, final_session_id, user_id, content, run_id
+            )
+        except Exception as e:  # noqa: BLE001 - 观测先行，异常继续上抛给 router
+            status, error_text = "error", f"{type(e).__name__}: {e}"
+            raise
         finally:
             # 无论成功或异常，都回收产物并销毁沙箱（release 内部先 recover 再 cleanup）
             await pool.release(final_session_id)
+            await run_observer.flush(run_id, status=status, error=error_text)
 
         turn: TurnRecord = await self._messages.record_turn(
             session_id=final_session_id,
@@ -207,10 +222,11 @@ class ChatService:
         session_id: str,
         user_id: str,
         content: str,
+        run_id: str = "",
     ) -> tuple[str, list[ToolCall]]:
         """调用 Agent 并解析回复正文与工具调用"""
         messages = await self._seed_context(session_id, content)
-        stream_config = self._thread_config(session_id, user_id)
+        stream_config = self._thread_config(session_id, user_id, run_id)
 
         result = await agent.ainvoke({"messages": messages}, stream_config)
         last_message = self._last_message(result)
@@ -258,6 +274,12 @@ class ChatService:
             if msg.role not in ("user", "assistant") or not msg.content:
                 continue
             seeded.append({"role": msg.role, "content": msg.content})
+
+        # 去重：L0 之后本轮用户消息**已经**写进 Redis 窗口（生成前落库），
+        # 窗口里最后一条就是它。不去重会出现「同一条用户消息喂两遍」。
+        if seeded and seeded[-1]["role"] == "user" and seeded[-1]["content"] == content:
+            seeded.pop()
+
         seeded.append(current)
         return seeded
 
@@ -278,18 +300,25 @@ class ChatService:
         return tup is None
 
     @staticmethod
-    def _thread_config(session_id: str, user_id: str) -> dict:
+    def _thread_config(session_id: str, user_id: str, run_id: str = "") -> dict:
         """LangGraph 运行配置：thread_id 与 session_id 一致，会话隔离
+
+        `run_id` 通过运行时上下文下传，观测中间件（middleware）从
+        `runtime.context` 读取；沙箱 backend 则从 `get_config()` 读 thread_id 后
+        反查 run_id。两个方向都要能拿到，否则两层的日志对不上。
 
         recursion_limit 是防失控闸门：小模型可能陷入「重复委派 / 反复重试
         失败工具」的循环，不加限制一条请求能跑上千步。超出后 LangGraph 抛
         GraphRecursionError，被 stream 的 except 捕获成 error 事件返回。
         """
+        configurable: dict[str, Any] = {
+            "thread_id": session_id,
+            "context": {"user_id": user_id, "run_id": run_id or session_id},
+        }
         return {
-            "configurable": {
-                "thread_id": session_id,
-                "context": {"user_id": user_id},
-            },
+            "configurable": configurable,
+            # 部分版本从顶层 context 取，两处都写，避免猜框架内部实现
+            "context": {"user_id": user_id, "run_id": run_id or session_id},
             "recursion_limit": get_settings().AGENT_RECURSION_LIMIT,
         }
 
@@ -303,6 +332,7 @@ class ChatService:
         user_id: str,
         created: bool,
         on_complete: Any,
+        agent_key: str = "",
     ) -> AsyncIterator[str]:
         """流式聊天并在结束后持久化，yield SSE 格式字符串
 
@@ -321,14 +351,22 @@ class ChatService:
                 使服务层不依赖 FastAPI 的 app 对象。
         """
         pool = await ensure_pool()
-        await pool.acquire(session_id)
+        await pool.acquire(session_id, user_id)
         tool_failure_breaker.reset(session_id)
+
+        # run_id 贯穿本次执行：观测 span、沙箱日志、SSE 事件都能靠它对上
+        run_id = str(uuid.uuid4())
+        run_observer.start(run_id, session_id, user_id, agent_key)
+        status: str = "ok"
+        error_text: Optional[str] = None
+
         try:
             # —— 首帧：会话元数据（自动创建的 session_id 通过它回传前端） ——
             yield _format_sse({
                 "type": "meta",
                 "session_id": session_id,
                 "created": created,
+                "run_id": run_id,
             })
 
             accumulated = ""
@@ -340,7 +378,7 @@ class ChatService:
 
             try:
                 messages = await self._seed_context(session_id, content)
-                stream_config = self._thread_config(session_id, user_id)
+                stream_config = self._thread_config(session_id, user_id, run_id)
 
                 logger.info(
                     "开始流式聊天(持久化): user_id=%s session_id=%s 回灌消息=%s",
@@ -391,11 +429,13 @@ class ChatService:
                 completed = True
 
             except Exception as e:
-                logger.exception("流式聊天异常: session_id=%s", session_id)
+                logger.exception("流式聊天异常: session_id=%s run_id=%s", session_id, run_id)
+                status, error_text = "error", f"{type(e).__name__}: {e}"
                 yield _format_sse({"type": "error", "message": str(e)})
                 return
 
             if not completed:
+                status = "cancelled"
                 return
 
             # —— 流式推送完毕，执行三存储持久化 ——
@@ -409,8 +449,10 @@ class ChatService:
                 persisted = False
 
             if not persisted:
+                status = "persist_failed"
                 logger.error(
-                    "回复已推送但持久化失败，历史中可能缺失本轮: session_id=%s", session_id
+                    "回复已推送但持久化失败，历史中可能缺失本轮: session_id=%s run_id=%s",
+                    session_id, run_id,
                 )
 
             yield _format_sse({
@@ -420,8 +462,11 @@ class ChatService:
                 "session_id": session_id,
             })
         finally:
-            pass
-            # await pool.release(session_id)
+            # 无论成功、异常还是客户端中途断连，都要回收沙箱。
+            # 这里曾是注释掉的（沙箱泄漏），1000 并发下几分钟就会打满池子。
+            await pool.release(session_id)
+            # 观测最后落库：放在 finally 里，保证异常/断连也有 span（且失败轮次全采）
+            await run_observer.flush(run_id, status=status, error=error_text)
 
     @staticmethod
     def _parse_node_update(chunk_data: Any) -> list[dict]:

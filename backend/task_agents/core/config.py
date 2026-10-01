@@ -50,6 +50,32 @@ class Settings(BaseSettings):
     # 设 0 或负数表示关闭熔断。
     TOOL_FAILURE_BREAK_THRESHOLD: int = 3
 
+    # —— 预算硬闸（单请求维度的兜底，0=关闭）——
+    # 单请求 token 上限（input+output 合计）。步数闸门管不住"每步都很贵"的情况：
+    # 一次塞进 50k 上下文的调用，30 步就是 150 万 token。
+    AGENT_MAX_TOKENS_PER_RUN: int = 0
+
+    # 单请求工具调用总次数上限。抓的是"参数每次都不同"的慢速空转——
+    # 连续失败熔断只认"同工具+同参数"，换个参数写就能绕过它。
+    AGENT_MAX_TOOL_CALLS_PER_RUN: int = 0
+
+    # ==================== 观测（第一节） ====================
+    # 落库的 span 集合名（MongoDB）
+    MONGO_SPAN_COLLECTION: str = "agent_spans"
+
+    # 成功轮次的 span 采样率（0.0~1.0）。1.0=全采。
+    # 失败 / 超时 / 超过 OBS_SLOW_RUN_MS 的轮次**始终全采**，不受此值影响。
+    OBS_SPAN_SAMPLE_RATE: float = 0.1
+
+    # 慢轮次阈值（毫秒）：超过它的轮次 span 全采，用于排查性能问题
+    OBS_SLOW_RUN_MS: int = 30000
+
+    # 是否记录载荷原文（代码、工具输出）。0=只记指纹与长度（默认，安全）。
+    # 1=记录截断后的原文（最多 OBS_PAYLOAD_MAX_CHARS 字符）。
+    # 开启前先想清楚：沙箱里可能有用户数据。
+    OBS_CAPTURE_PAYLOAD: int = 0
+    OBS_PAYLOAD_MAX_CHARS: int = 500
+
 
 
     # ==================== MySQL 配置 ====================
@@ -127,6 +153,18 @@ class Settings(BaseSettings):
     # 传给 Daytona 的 auto_stop_interval（分钟），远端兜底自动停止。
     # 0=不自动停止（现状）。建议与 SANDBOX_IDLE_TTL_SECONDS 配套设成 15
     SANDBOX_AUTO_STOP_MINUTES: int = 0
+
+    # 空闲回收器的扫描间隔（秒）。仅在 SANDBOX_IDLE_TTL_SECONDS > 0 时启动
+    SANDBOX_REAPER_INTERVAL_SECONDS: int = 30
+
+    # 启动时是否回收孤儿沙箱（上次进程残留的、带 app=task-agents 标签的）。
+    # 0=不回收。**多实例部署时必须保持 0**——否则会删掉其它实例的在用沙箱；
+    # 单实例部署可以设 1。
+    SANDBOX_RECLAIM_ORPHANS: int = 0
+
+    # 孤儿判定阈值（秒）：last_activity_at 早于这个时长的才算残留。
+    # 仅在 SANDBOX_RECLAIM_ORPHANS=1 时生效
+    SANDBOX_ORPHAN_MAX_IDLE_SECONDS: int = 3600
 
 
     # ==================== 程序员工具配置 ====================

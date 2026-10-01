@@ -149,6 +149,80 @@ class MessageWriteService:
                 turn.session_id, e,
             )
 
+    async def record_user_message(
+        self,
+        session_id: str,
+        user_id: str,
+        user_content: str,
+    ) -> StoredMessage:
+        """只记录用户消息（第五节 L0：消息先落库）
+
+        为什么要在生成**之前**落库：SSE 流式路径原来是在整轮结束后才写
+        user + assistant，一旦中途断连（刷新页面 / 网络抖动 / 进程重启），
+        连用户刚发出的消息都一起丢了——刷新后看到的是发消息之前的会话。
+
+        先落库后，最坏情况只是多一条没有回复的用户消息（可重发），
+        而不是整轮凭空消失。
+
+        MongoDB 这里**同步 await**：用户消息必须先真正持久化，否则就失去意义。
+        """
+        base_count = await self._message_count(session_id)
+        seq = await self._next_seq(session_id, fallback_base=base_count)
+        message = StoredMessage(seq=seq, role="user", content=user_content)
+
+        await self._append_to_redis(session_id, [message])
+        await self.write_messages_to_mongo(session_id, [message])
+        await self._touch_mysql(session_id, delta=1)
+
+        logger.info(
+            "用户消息已先落库: session_id=%s seq=%s", session_id, seq
+        )
+        return message
+
+    async def record_assistant_message(
+        self,
+        session_id: str,
+        user_id: str,
+        assistant_content: str,
+        assistant_tool_calls: Optional[list[ToolCall]] = None,
+        assistant_thinking_steps: Optional[list[ThinkingStep]] = None,
+        assistant_citations: Optional[list[Citation]] = None,
+    ) -> tuple[StoredMessage, Optional[int]]:
+        """只记录助手消息（用户消息已由 record_user_message 先行落库）
+
+        Returns:
+            (assistant_message, 最新 message_count)
+        """
+        base_count = await self._message_count(session_id)
+        seq = await self._next_seq(session_id, fallback_base=base_count)
+        message = StoredMessage(
+            seq=seq,
+            role="assistant",
+            content=assistant_content,
+            tool_calls=assistant_tool_calls or [],
+            thinking_steps=assistant_thinking_steps or [],
+            citations=assistant_citations or [],
+        )
+
+        await self._append_to_redis(session_id, [message])
+        await self.write_messages_to_mongo(session_id, [message])
+        count = await self._touch_mysql(session_id, delta=1)
+
+        logger.info(
+            "助手消息已落库: session_id=%s seq=%s count=%s", session_id, seq, count
+        )
+        return message, count
+
+    async def _append_to_redis(self, session_id: str, messages: list[StoredMessage]) -> None:
+        """同步写 Redis 上下文，失败只降级不阻断"""
+        try:
+            await self.redis_repo.append_messages(session_id, messages)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "Redis 上下文写入失败，已降级（消息仍会落 MongoDB）: session_id=%s error=%s",
+                session_id, e,
+            )
+
     async def _touch_mysql(self, session_id: str, delta: int) -> Optional[int]:
         """更新 MySQL 的 updated_at 与 message_count，返回最新计数
 

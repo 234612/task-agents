@@ -161,6 +161,78 @@ async def persist_turn(
         return None
 
 
+async def persist_user_message(
+    app: Any,
+    session_id: str,
+    user_id: str,
+    user_content: str,
+) -> bool:
+    """流式路径开始**之前**先落用户消息（第五节 L0）
+
+    失败只记日志：落库失败不该阻止生成，用户仍然能看到回复。
+    """
+    factory = _db_factory(app)
+    try:
+        mongo_repo, redis_repo = build_repos(app)
+        async with factory() as db:
+            service = MessageWriteService(
+                session_repo=MySQLSessionRepository(db),
+                mongo_repo=mongo_repo,
+                redis_repo=redis_repo,
+            )
+            await service.record_user_message(
+                session_id=session_id,
+                user_id=user_id,
+                user_content=user_content,
+            )
+            return True
+    except Exception:
+        logger.exception(
+            "用户消息先落库失败（本轮断连会丢消息）: session_id=%s user_id=%s",
+            session_id, user_id,
+        )
+        return False
+
+
+async def persist_assistant_message(
+    app: Any,
+    session_id: str,
+    user_id: str,
+    assistant_content: str,
+    assistant_tool_calls: Optional[list[ToolCall]] = None,
+    assistant_thinking_steps: Optional[list[ThinkingStep]] = None,
+    assistant_citations: Optional[list[Citation]] = None,
+) -> Optional[int]:
+    """流式路径结束时只落助手消息（用户消息已先行落库）
+
+    Returns:
+        最新 message_count；失败返回 None。
+    """
+    factory = _db_factory(app)
+    try:
+        mongo_repo, redis_repo = build_repos(app)
+        async with factory() as db:
+            service = MessageWriteService(
+                session_repo=MySQLSessionRepository(db),
+                mongo_repo=mongo_repo,
+                redis_repo=redis_repo,
+            )
+            _, count = await service.record_assistant_message(
+                session_id=session_id,
+                user_id=user_id,
+                assistant_content=assistant_content,
+                assistant_tool_calls=assistant_tool_calls,
+                assistant_thinking_steps=assistant_thinking_steps,
+                assistant_citations=assistant_citations,
+            )
+            return count
+    except Exception:
+        logger.exception(
+            "助手消息落库失败: session_id=%s user_id=%s", session_id, user_id
+        )
+        return None
+
+
 async def persist_messages(app: Any, session_id: str, messages: list[StoredMessage]) -> None:
     """把一轮对话的消息异步追加到 MongoDB
 
@@ -195,6 +267,8 @@ __all__ = [
     "backfill_title",
     "build_repos",
     "get_message_count",
+    "persist_assistant_message",
     "persist_messages",
     "persist_turn",
+    "persist_user_message",
 ]

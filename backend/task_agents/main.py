@@ -45,9 +45,32 @@ async def lifespan(app: FastAPI):
     # 创建 Agent（传入容器）
     agents = build_agents()
     app.state.agents = agents
+
+    # 观测 span 的索引与 TTL（失败只影响观测，不阻断启动）
+    try:
+        from task_agents.core.config import get_settings
+        from task_agents.repository.mongo_span_repository import MongoSpanRepository
+
+        span_repo = MongoSpanRepository(
+            app.state.mongo_db, get_settings().MONGO_SPAN_COLLECTION
+        )
+        await span_repo.ensure_indexes()
+    except Exception:  # noqa: BLE001
+        logger.exception("观测索引创建失败（span 仍会写入，仅缺索引）")
+
+    # 回收上次进程残留的孤儿沙箱（默认关闭，见 SANDBOX_RECLAIM_ORPHANS）
+    from task_agents.sandbox.sandbox_registry import ensure_pool
+
+    pool = await ensure_pool()
+    await pool.reclaim_orphans()
+
     logger.info("🎉 服务启动完成，开始接收请求")
     yield
     # ========== 关闭阶段 ==========
+    # 先清沙箱再关客户端：Daytona 的删除还要走网络，客户端没了就清理不掉了
+    from task_agents.sandbox.sandbox_registry import shutdown_pool
+
+    await shutdown_pool()
     await container.shutdown()
     logger.info("👋 服务已关闭")
 
@@ -84,6 +107,15 @@ async def health_db(request: Request):
     except Exception as e:
         logger.exception("MySQL 健康检查失败")
         raise HTTPException(status_code=503, detail=f"MySQL 不可用: {type(e).__name__}") from e
+
+
+@app.get("/health/sandbox", summary="沙箱池状态")
+async def health_sandbox():
+    """沙箱池容量与生命周期状态：验证 7.1 的治理项是否已生效"""
+    from task_agents.sandbox.sandbox_registry import ensure_pool
+
+    pool = await ensure_pool()
+    return pool.stats()
 
 
 @app.get("/agents", summary="列出已注册的 Agent")
